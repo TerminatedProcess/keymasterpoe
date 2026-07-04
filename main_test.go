@@ -7,6 +7,8 @@ import (
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+	"github.com/muesli/termenv"
 )
 
 // newTestModel builds a model whose three stores live under a temp root, so
@@ -113,7 +115,7 @@ func TestOverwriteSemantics(t *testing.T) {
 	}
 }
 
-func TestListKeysAndDup(t *testing.T) {
+func TestListKeysAndMembership(t *testing.T) {
 	m := newTestModel(t)
 	setKey(t, m, m.vaultDir, "shared", "", "v")
 	setKey(t, m, m.publicDir, "shared", "", "v")
@@ -126,11 +128,14 @@ func TestListKeysAndDup(t *testing.T) {
 	if m.exists[panelProject] {
 		t.Fatal("project store should not exist")
 	}
-	if got := m.dupCount("shared"); got != 2 {
-		t.Fatalf("dupCount(shared) = %d, want 2", got)
+	if !m.names[panelVault]["shared"] || !m.names[panelPublic]["shared"] {
+		t.Fatal("shared should be in both VAULT and PUBLIC")
 	}
-	if got := m.dupCount("public-only"); got != 1 {
-		t.Fatalf("dupCount(public-only) = %d, want 1", got)
+	if m.names[panelVault]["public-only"] {
+		t.Fatal("public-only should not be in VAULT")
+	}
+	if !m.names[panelPublic]["public-only"] {
+		t.Fatal("public-only should be in PUBLIC")
 	}
 }
 
@@ -167,7 +172,7 @@ func TestViewSmoke(t *testing.T) {
 	// exercise each mode's prompt + the help screen
 	for _, mode := range []mode{modeNormal, modeFilter, modeAddName, modeAddDesc, modeConfirm} {
 		m.mode = mode
-		m.pending = pending{kind: "delete", key: "alpha-key", src: panelVault}
+		m.pending = pending{kind: "copy", key: "alpha-key", src: panelVault, dst: panelPublic}
 		if out := m.View(); len(out) == 0 {
 			t.Fatalf("empty view in mode %d", mode)
 		}
@@ -179,21 +184,44 @@ func TestViewSmoke(t *testing.T) {
 	}
 }
 
-// TestSelectionAndDupTag verifies selection tracks the filtered list and the
-// dup tag appears for cross-store keys.
-func TestSelectionAndDupTag(t *testing.T) {
+// TestIndicators verifies the unified indicator language across all three panes.
+// Not-in-VAULT and reach both render as ●, distinguished only by color, so we
+// force an ANSI256 profile and assert on the color codes.
+func TestIndicators(t *testing.T) {
+	lipgloss.SetColorProfile(termenv.ANSI256)
+	const red, green, purple = "38;5;196", "38;5;82", "38;5;141"
+
 	m := newTestModel(t)
-	setKey(t, m, m.vaultDir, "shared", "", "v")
-	setKey(t, m, m.publicDir, "shared", "", "v")
+	// key2 lives in all three stores; orphan only in public (not backed up).
+	setKey(t, m, m.vaultDir, "key2", "", "v")
+	setKey(t, m, m.publicDir, "key2", "", "v")
+	setKey(t, m, m.projectDir, "key2", "", "v")
+	setKey(t, m, m.publicDir, "orphan", "", "v")
 	m.reload()
-	m.active = panelVault
-	m.cursors[panelVault] = 0
-	if k := m.selected(); k == nil || k.Name != "shared" {
-		t.Fatalf("selected() = %v, want shared", k)
+
+	if k := m.selected(); k == nil { // selection sanity (active defaults to vault)
+		t.Fatal("selected() = nil")
 	}
-	row := m.renderRow(Key{Name: "shared"}, panelVault, false, 40)
-	if !contains(row, "dup") {
-		t.Fatalf("expected ⇄dup tag in row, got %q", row)
+
+	// VAULT: deployed to PUBLIC+PROJECT → green + purple dots, never red.
+	v := m.renderRow(Key{Name: "key2"}, panelVault, false, 40)
+	if !contains(v, green) || !contains(v, purple) || contains(v, red) {
+		t.Fatalf("vault key2 should be green+purple, no red: %q", v)
+	}
+	// PUBLIC key2: backed up (no red) AND also in PROJECT (purple dot).
+	pu := m.renderRow(Key{Name: "key2"}, panelPublic, false, 40)
+	if contains(pu, red) || !contains(pu, purple) {
+		t.Fatalf("public key2 should be purple, no red: %q", pu)
+	}
+	// PROJECT key2: backed up (no red) AND also in PUBLIC (green dot).
+	pr := m.renderRow(Key{Name: "key2"}, panelProject, false, 40)
+	if contains(pr, red) || !contains(pr, green) {
+		t.Fatalf("project key2 should be green, no red: %q", pr)
+	}
+	// orphan in PUBLIC but not VAULT → red dot (not backed up).
+	o := m.renderRow(Key{Name: "orphan"}, panelPublic, false, 40)
+	if !contains(o, red) {
+		t.Fatalf("orphan public should show red not-in-vault dot: %q", o)
 	}
 }
 
@@ -207,4 +235,78 @@ func indexOf(s, sub string) int {
 		}
 	}
 	return -1
+}
+
+// TestValueDriftDetection checks the external-hash comparison flags only real
+// value differences (never the plaintext into keymaster).
+func TestValueDriftDetection(t *testing.T) {
+	m := newTestModel(t)
+	setKey(t, m, m.vaultDir, "same", "", "identical")
+	setKey(t, m, m.publicDir, "same", "", "identical")
+	setKey(t, m, m.vaultDir, "diff", "", "value-A")
+	setKey(t, m, m.publicDir, "diff", "", "value-B")
+	m.reload()
+
+	m.checkDrift("same")
+	if len(m.driftBad) != 0 {
+		t.Fatalf("identical values flagged as drift: %v / %q", m.driftBad, m.driftText)
+	}
+	m.checkDrift("diff")
+	if !m.driftBad[panelPublic] {
+		t.Fatalf("differing values not flagged: %v / %q", m.driftBad, m.driftText)
+	}
+}
+
+// TestSyncBackfillAndConflict exercises panel→VAULT sync: backfill of missing
+// keys, conflict detection on differing values, and override resolution.
+func TestSyncBackfillAndConflict(t *testing.T) {
+	m := newTestModel(t)
+	setKey(t, m, m.publicDir, "new-key", "d1", "v-new")     // not in vault
+	setKey(t, m, m.publicDir, "match-key", "", "same")      // == vault
+	setKey(t, m, m.vaultDir, "match-key", "", "same")
+	setKey(t, m, m.publicDir, "diff-key", "", "public-val") // != vault
+	setKey(t, m, m.vaultDir, "diff-key", "", "vault-val")
+	m.reload()
+	m.active = panelPublic
+
+	m.startSync()
+
+	if !m.names[panelVault]["new-key"] {
+		t.Fatal("new-key was not backfilled into VAULT")
+	}
+	if len(m.syncConflicts) != 1 || m.syncConflicts[0] != "diff-key" {
+		t.Fatalf("expected diff-key as the sole conflict, got %v", m.syncConflicts)
+	}
+	if m.mode != modeSyncConflict {
+		t.Fatalf("expected modeSyncConflict, got %d", m.mode)
+	}
+
+	// override the conflict → VAULT value should now match PUBLIC's
+	mm, _ := m.handleSyncConflictKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	m = mm.(model)
+	if renderHash(t, m, m.vaultDir, "diff-key") != renderHash(t, m, m.publicDir, "diff-key") {
+		t.Fatal("override did not replace the VAULT value")
+	}
+}
+
+// TestVaultDeleteScope checks the VAULT delete rules build the right rm queue.
+func TestVaultDeleteScope(t *testing.T) {
+	m := newTestModel(t)
+	setKey(t, m, m.vaultDir, "k", "", "v")
+	setKey(t, m, m.projectDir, "k", "", "v") // deployed to PROJECT only
+	m.reload()
+	m.active = panelVault
+	m.cursors[panelVault] = 0
+	m.startDelete() // deployed → should enter scope modal, not delete yet
+	if m.mode != modeVDelete {
+		t.Fatalf("expected modeVDelete for a deployed vault key, got %d", m.mode)
+	}
+	// choose "vault only" → queue is just VAULT
+	m.rmKey = "k"
+	mm, _ := m.handleVDeleteKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'v'}})
+	m = mm.(model)
+	// after runRmQueue pops VAULT, queue is drained (rm itself runs via ExecProcess)
+	if len(m.rmQueue) != 0 {
+		t.Fatalf("expected queue drained to 0 after popping VAULT, got %v", m.rmQueue)
+	}
 }

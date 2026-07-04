@@ -34,7 +34,7 @@ agent-vault keeps one encrypted store per directory: `<dir>/vault.json` (ciphert
 **Paradigm vs. skills-vault (important):** skills-vault promotes by **symlink** — one master, zero drift. Keys **cannot** be symlinked (each store is a self-contained encrypted blob), so distribution is a **copy of the value** and each copy is thereafter **independent** — a project can edit its value without touching VAULT, and vice-versa. VAULT is master *by convention*, not by link. Sync is therefore explicit:
 - **VAULT stays complete automatically** — adding a key to PUBLIC/PROJECT also mirrors it into VAULT.
 - **Updating VAULT is manual** — copy a store's key onto VAULT to replace the master with that copy's current value ("promote back up"). `set` overwrites, so copying onto an existing key confirms first.
-- `⇄dup` flags a shared key **name** only; values may already differ (can't tell without revealing).
+- The UI shows **reach indicators, not value comparisons** (can't, without revealing): the VAULT holds keys and deploys nothing; PUBLIC/PROJECT are peer deployments. See §4.1 for the indicator language.
 
 ### 2.2 CLI contract (verified by test in a throwaway `/tmp` vault)
 
@@ -93,17 +93,21 @@ Add/delete need a TTY. A Bubble Tea app owns the terminal, so it hands the real 
 ┌ keymaster ─ /home/dev/work/onboarding ─────────────────────────────────────────────────┐
 │  VAULT (~/.config/keymasterpoe/agent-vault/vault)  │  PUBLIC (~/.agent-vault)    │  PROJECT (./.agent-vault) │
 │  ───────────────────────────────────  │  ──────────────────────    │  ──────────────────────   │
-│  coolify-api-token                    │  coolify-api-token   ⇄dup   │  secret-key               │
-│▸ github-pat                           │  github-pat          ⇄dup   │  gmail-client-id          │
-│  grok-api-key                ⇄dup     │  grok-api-key        ⇄dup   │  grok-api-key       ⇄dup  │
-│  nvidia-api-key                       │  ovh-vps-password           │  telegram-bot-token       │
+│  coolify-api-token                    │    coolify-api-token        │  secret-key               │
+│▸● github-pat                          │    github-pat               │  gmail-client-id          │
+│ ●grok-api-key                         │  ● grok-api-key             │ ●grok-api-key             │
+│  nvidia-api-key                       │ ●ovh-vps-password (red)     │  telegram-bot-token       │
 │  ...                                  │                             │  test-delete-me           │
 │  55 keys                              │  11 keys                    │  23 keys                  │
 └─────────────────────────────────────────────────────────────────────────────────────────┘
  [tab] switch  [s]→vault [g]→public [p]→project  (SHIFT=move)  [a]dd  [d]elete  [/]filter  [?]help  [q]uit
 ```
 - Header shows `cwd`. Each pane header shows its store path + count.
-- Keys present in **more than one** store are tagged (e.g. `⇄dup`) so duplicated/misplaced secrets are obvious at a glance. (Values are not compared — can't, without revealing.)
+- **Indicator language** (2-slot prefix; fixed colors: green=PUBLIC · purple=PROJECT · red=alarm). The VAULT *holds* keys and deploys nothing; PUBLIC/PROJECT are peer *deployments*:
+  - **VAULT row** — where the key is deployed: green ● = PUBLIC, purple ● = PROJECT (both possible; **no dot = held only, not deployed**). Above: `github-pat` green ● (in public), `grok-api-key` green+purple (in both).
+  - **PUBLIC / PROJECT row** — **red ●** = the key is **not backed up to VAULT** (fix with `s`, or `y` to sync the whole pane). A colored dot = the key is **also deployed to the sibling** store (purple ● on a PUBLIC row = also in PROJECT; green ● on a PROJECT row = also in PUBLIC).
+  - **red ≠** (trailing, on demand) — after `c` checks the selected key, a store whose value *differs* from the baseline is flagged. Dots mark **reach** (presence); `≠` is the only value-equality signal, computed via external `sha256sum` fingerprints (§5), never a reveal.
+  - Neither deployment is "the duplicate"; they're peers.
 - Focused pane highlighted; `▸` marks the selected row.
 - **No project vault?** PROJECT pane renders a placeholder: *"no project vault at ./.agent-vault — press [a] to add a key or [g]/[p]/[s] to push one here (creates it)."*
 
@@ -117,14 +121,18 @@ Promotion is **directional** (three targets), like `viewskills`' `g`/`p`/`s`. Lo
 | `s` / `S` | **copy** / **move** selected key → VAULT (onto an existing key = "update master") |
 | `g` / `G` | **copy** / **move** selected key → PUBLIC |
 | `p` / `P` | **copy** / **move** selected key → PROJECT |
+| `y` | **sync** focused deployment pane → VAULT (backfill missing keys; hash-compare the rest, prompt to override only those that differ) |
+| `c` | **check drift** — hash-compare the selected key's value across the stores it's in; verdict in the detail box + red `≠` on differing rows |
 | `a` / `n` | **add** a new key to the focused pane (auto-mirrors into VAULT) |
-| `d` | **delete** selected key from the focused store only (confirm modal) |
+| `d` | **delete** — deployment pane: that copy only. VAULT: scope modal (see below). Each `rm` prompts y/n on the TTY itself |
 | `/` | fuzzy filter within focused pane (`sahilm/fuzzy`, like viewskills) |
 | `R` | refresh all panes |
 | `?` | help overlay |
 | `q` / `esc` | quit |
 
-No reveal, no in-place edit, no value diff. Destructive/interactive actions (`a`, `d`, and the `rm` half of a move) shell out on a TTY via `tea.ExecProcess` and get a confirmation step where they mutate; a plain copy is silent (`os/exec`). **Copying onto a key that already exists in the target overwrites it → confirm first** (this is the intended path for updating the VAULT master).
+**Delete scope.** A deployment-pane delete removes only that copy. A **VAULT** delete of a *deployed* key can't silently orphan it: if it's in **PUBLIC**, keymaster requires delete-both-or-cancel (public can't be orphaned); if in **PROJECT**, it offers VAULT-only *or* both; in both, VAULT+PUBLIC (keep project) or all three. keymaster only sees the current project's `.agent-vault`. Each store's removal is a separate `agent-vault rm` TTY prompt, sequenced.
+
+**Confirms.** Interactive actions (`a`, `d`, `rm`-half of a move) shell out on a TTY via `tea.ExecProcess`; `agent-vault` prompts there. The two places keymaster owns a confirm — because they're silent `os/exec` — are **overwrite** (copying onto an existing key → "update the master") and **sync value conflicts** (a key whose deployment value differs from VAULT → override? y/n/all/skip). Value comparison uses external `sha256sum` fingerprints (see §5) — never a reveal.
 
 ### 4.3 Flows / operation recipes
 
@@ -176,6 +184,7 @@ AGENT_VAULT_DIR=<P> agent-vault list      # project (empty/err if dir missing �
 
 - **Plaintext never enters the TUI process.** Store-to-store relays go value→temp-file (via `write`) then file→`set --stdin`; the Go code passes file paths only. Add/delete are handed to `agent-vault` on the **real terminal** via `tea.ExecProcess`.
 - **No reveal, ever.** keymaster has no code path that displays a value. Values are entered once at creation (into `agent-vault set` on a real TTY) and never shown by the tool again. Revealing is a manual, out-of-tool action.
+- **Value comparison by fingerprint only** (drift check `c`, sync conflicts `y`). A value is rendered to a 0600 temp (the sanctioned `agent-vault write` relay) and hashed by an **external `sha256sum`**, so the plaintext enters *that* process, never keymaster's — keymaster holds only the one-way digest, compares it, and discards it. No value is displayed or persisted. This softens the original "can't compare values" stance while preserving "never reveal / never hold plaintext". Digests are used in-memory for equality and never logged.
 - **Temp files:** `mktemp` mode 0600, `shred -u` immediately after use, and on a `defer`/cleanup path for error cases. Never under a git-tracked dir.
 - **No logging of values.** Debug logs may include key *names* and store paths, never contents. No value in window title, status line, or crash dumps.
 - **Confirmation** before `move`/`delete` (irreversible on the source).
@@ -227,7 +236,7 @@ Model/Update/View Bubble Tea structure. Shell out to `agent-vault` via `os/exec`
   rm -rf /tmp/avtest-*
   ```
 - **Real smoke test target:** the `onboarding` project vault already contains a junk key `test-delete-me` and cross-store dupes (`grok/groq/nvidia-api-key`) — perfect first real exercise (move the dupes to PUBLIC/VAULT, delete the junk). Do this *with* the user, since `rm`/`set` are their calls.
-- Verify: no value ever appears in TUI output/logs (and there is no reveal path at all); temp files are shredded; stores auto-create on first push; dup-tagging is correct across all three panes.
+- Verify: no value ever appears in TUI output/logs (fingerprinting shells to external `sha256sum`, so plaintext never enters the process; only digests are held); temp files are shredded; stores auto-create on first push; indicators are correct (deploy dots on VAULT rows; red ● not-in-vault + cross-deploy dots on PUBLIC/PROJECT rows; red `≠` only after `c`).
 
 ---
 
@@ -247,7 +256,7 @@ Model/Update/View Bubble Tea structure. Shell out to `agent-vault` via `os/exec`
 
 ## 10. Future (post-v1)
 - Rename, edit-value, `.env` import/export panes.
-- Bulk reconcile helper: one-key action to sweep pre-existing `⇄dup` keys into VAULT (v1 already auto-mirrors on *add*; this backfills keys created before keymaster or outside it).
+- (Implemented in v1 as `y` sync.) Bulk reconcile: sweep every deployment key marked red ● (not backed up) up into VAULT, resolving value conflicts against the master.
 - Show descriptions inline / detail pane.
 - Drift indicator when a key exists in multiple stores with different values (can't compare values safely without reveal — likely show "differs?" only via a hash agent-vault would need to expose; probably out of scope).
 - Config for extra named vault dirs beyond vault+public+cwd.

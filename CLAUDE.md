@@ -23,7 +23,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **Distribution = copy of the value**, not a link. Each store's copy is then **independent** — editing a project's value does NOT touch the VAULT copy, and vice-versa. VAULT is master **by convention**, not by link.
 - **VAULT stays complete automatically:** adding a key to PUBLIC or PROJECT also mirrors it into VAULT (silent copy right after the interactive `set`), so the library never misses a key you created. Adding directly to VAULT needs no mirror.
 - **Updating VAULT is manual and explicit:** copy a store's key onto VAULT (`s`/`S`) to replace the master with that copy's current value — this is how you "promote a project's edited value back up." Copying onto an existing key **overwrites** it → confirm first.
-- Because copies are independent, `⇄dup` flags only that two stores share a key **name**; the values may already differ (can't tell without revealing).
+- Because copies are independent, keymaster shows **reach indicators**, never value comparisons (it can't — no reveal). The VAULT is a *library* (holds keys, deployed to nothing); PUBLIC/PROJECT are peer *deployments*. See the indicator language under Architecture.
 
 ## Build & Run
 
@@ -37,6 +37,8 @@ Install to `~/go/bin/` (where `viewskills` lives). Go 1.26; `charmbracelet/bubbl
 ## The security invariant (the whole point)
 
 **Plaintext values must NEVER pass through keymaster's own process memory, and keymaster NEVER reveals a value.** After a key is created (value typed once into `agent-vault` on a real TTY), this app only ever handles *file paths* and *key names*. There is **no reveal feature** — deliberately. The Go code touching a secret byte, or the app displaying a value, both defeat the reason the tool exists.
+
+**One deliberate relaxation — value comparison by fingerprint** (`valueHash`): drift-check (`c`) and sync (`y`) need to know if two stores' values differ. keymaster renders each value to a 0600 temp (the same sanctioned `agent-vault write` relay as copy) and hashes it with an **external `sha256sum`**, so plaintext enters *that* process, never keymaster's — keymaster holds only the one-way digest, compares, discards. No value is ever displayed or persisted. This keeps "never reveal" while softening "can't compare".
 
 - **Move a value between stores** → never `get --reveal`. Use `agent-vault write <tmp> --content '<agent-vault:KEY>'` to render the real value into a 0600 temp file, then `agent-vault set KEY --stdin < tmp`. The value transits a shredded temp file only — never displayed, never in app memory. `shred -u` the temp immediately + on a `defer`/error path.
 - **Add / delete / move-rm** need a real TTY → hand them to `agent-vault` via **`tea.ExecProcess`** (suspends the TUI, like launching `$EDITOR`). Silent copy ops use plain `os/exec`.
@@ -64,13 +66,31 @@ Promotion is directional (like viewskills' `g`/`p`/`s`), because there are three
 - **Add** K to store S: prompt for key name + desc in the TUI, then hand the *value* entry to `AGENT_VAULT_DIR=<S> agent-vault set K --desc '...'` via `tea.ExecProcess`. **If S ≠ VAULT, mirror into VAULT afterward** (silent Copy recipe, S→VAULT) so the master stays complete.
 - **Update VAULT** (replace master with an edited project/public copy): the Copy recipe with dst=VAULT — `set` overwrites the existing master value. This is the "promote back up" flow; confirm first.
 - **Delete**: `AGENT_VAULT_DIR=<S> agent-vault rm K` via `tea.ExecProcess` (confirm). Deletes only the copy in S — other stores' copies (incl. VAULT) are untouched.
-- **No reveal, no in-place edit, no value diff** — can't compare values without revealing, so a shared key across stores shows only `⇄dup`, never a value comparison.
+- **No reveal, no in-place edit.** Cross-store *presence* is shown by reach dots (red ● = not backed up to VAULT); *value* comparison exists only on demand via external `sha256sum` fingerprints (`c` drift check, `y` sync) — a digest, never a revealed value.
 
 ## Architecture (planned — mirror viewskills' 3-panel layout)
 
-Standard Bubble Tea `Init → Update → View`. **Three-pane** model (VAULT / PUBLIC / PROJECT), each with its own cursor + key list. Keys present in more than one store get a `⇄dup` tag. Missing project vault → PROJECT pane shows a placeholder prompting a push to create it (first `set` auto-inits). `/` fuzzy-filters the focused pane. See `viewskills/main.go` for the pattern (panels, `tea.ExecProcess` for TTY handoff, reload-after-mutation).
+Standard Bubble Tea `Init → Update → View`. **Three-pane** model (VAULT / PUBLIC / PROJECT), each with its own cursor + key list. Missing project vault → PROJECT pane shows a placeholder prompting a push to create it (first `set` auto-inits). `/` fuzzy-filters the focused pane. See `viewskills/main.go` for the pattern (panels, `tea.ExecProcess` for TTY handoff, reload-after-mutation).
 
-Keybindings (adapted from viewskills — directional promotion, no reveal/diff/edit): `tab`/`h`/`l`/`←→` switch pane · `j`/`k`/`↑↓` navigate · `/` filter · `s` copy→VAULT (also "update master") · `g` copy→PUBLIC · `p` copy→PROJECT · `S`/`G`/`P` **move** (copy then rm source) · `a`/`n` add (auto-mirrors to VAULT) · `d` delete (confirm) · `R` refresh all · `?` help · `q`/`esc` quit. Copy is silent (`os/exec`); add/delete/move-rm shell out on a TTY via `tea.ExecProcess`. Copying onto an existing key confirms (overwrite). **Reload all three panes after any mutation.**
+**Indicator language** (`renderRow`, fixed colors: green=PUBLIC · purple=PROJECT · red=alarm). The VAULT is a *library* (holds keys, deployed to nothing); PUBLIC/PROJECT are peer *deployments*. Each row has a 2-slot prefix:
+- **VAULT row** — where the key is deployed: green ● = PUBLIC, purple ● = PROJECT (no dot = held only, not deployed).
+- **PUBLIC / PROJECT row** — slot1: **red ●** when the key is **not backed up to VAULT** (fix with `s` for one, or `y` to sync the whole pane). slot2: a dot when the key is **also deployed to the sibling** deployment (purple ● on PUBLIC = also in PROJECT; green ● on PROJECT = also in PUBLIC).
+- **Trailing red ≠** — appears on a row after `c` (check drift) when that store's value *differs* from the baseline. Dots mark **reach** (presence); `≠` is the only value-equality signal, and only computed on demand.
+- There is no "dup" tag; neither deployment is "the duplicate" — they're peers.
+
+**Keymaster-owned actions beyond copy/move/add/delete:**
+- `c` **check drift** — fingerprint-compares the selected key's value across the stores it's in (on-demand `valueHash`); verdict in the detail box + red `≠` on differing rows. Cleared on any reload.
+- `y` **sync pane → VAULT** — backfills every not-in-VAULT key from the focused deployment pane; for keys already in VAULT, hash-compares and prompts (`modeSyncConflict`: y/n/all/skip) to override only the ones whose values differ.
+
+**Delete scope rules** (`startDelete` → `modeVDelete` → sequential `rmQueue`, each `rm` its own TTY prompt):
+- Deployment pane (PUBLIC/PROJECT) → deletes that copy only.
+- VAULT, key not deployed → deletes it.
+- VAULT, deployed to **PUBLIC** → can't orphan public: `[y]` delete both, or cancel (won't delete VAULT alone).
+- VAULT, deployed to **PROJECT** → `[v]` VAULT only (orphan project, allowed) or `[b]` both.
+- VAULT, in both → `[b]` VAULT+PUBLIC (keep project) or `[a]` all three (public always goes with it).
+- keymaster only sees the *current* project's `.agent-vault`; keys in other projects aren't tracked.
+
+Keybindings: `tab`/`h`/`l`/`←→` switch pane · `j`/`k`/`↑↓` navigate · `/` filter · `s` copy→VAULT (also "update master") · `g` copy→PUBLIC · `p` copy→PROJECT · `S`/`G`/`P` **move** (copy then rm source) · `y` **sync** pane→VAULT · `c` **check** drift · `a`/`n` add (auto-mirrors to VAULT) · `d` delete (scope rules above) · `R` refresh all · `?` help · `q`/`esc` quit. Copy is silent (`os/exec`); add/delete/move-rm shell out on a TTY via `tea.ExecProcess`. **Delete has no keymaster modal** — `agent-vault rm` prompts y/n on the TTY itself, so a second confirm would be redundant. Copying onto an existing key confirms (overwrite) in the TUI, since a plain copy is silent. **Reload all three panes after any mutation.**
 
 ## Testing
 
@@ -81,7 +101,7 @@ printf 'dummy' | agent-vault set k1 --stdin
 # exercise copy/move/list/add/delete across three fake stores
 rm -rf /tmp/avtest-*
 ```
-Verify: value never appears in TUI output/logs; temp files shredded; stores auto-create on first push; dup-tagging correct across all three panes; there is no code path that reveals a value. The `onboarding` project vault has real fixtures (`test-delete-me`, cross-store dupes `grok/groq/nvidia-api-key`) — exercise those *with the user*, since `rm`/`set` are their calls.
+Verify: value never appears in TUI output/logs; temp files shredded; stores auto-create on first push; indicator logic correct (deploy dots on VAULT rows; red ● not-in-vault + cross-deploy dots on PUBLIC/PROJECT rows; red `≠` only after `c`); fingerprinting shells to external `sha256sum` and never holds plaintext; there is no code path that reveals a value. The `onboarding` project vault has real fixtures (`test-delete-me`, cross-store dupes `grok/groq/nvidia-api-key`) — exercise those *with the user*, since `rm`/`set` are their calls.
 
 ## Cutover (post-build)
 
