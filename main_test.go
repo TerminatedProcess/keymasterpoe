@@ -405,6 +405,37 @@ func TestGroupRowsAndPush(t *testing.T) {
 	}
 }
 
+// TestDisbandVaultOnly checks a group can be disbanded from VAULT but not from a
+// deployment pane (the definition is global).
+func TestDisbandVaultOnly(t *testing.T) {
+	m := newTestModel(t)
+	m.groupsPath = filepath.Join(t.TempDir(), "groups.json")
+	setKey(t, m, m.vaultDir, "docuseal-api-key", "", "v")
+	setKey(t, m, m.publicDir, "docuseal-api-key", "", "v")
+	m.reload()
+	m.assignGroup("docuseal-api-key", "docuseal")
+	m.reload()
+
+	// from PUBLIC: d on the header must be rejected, group intact
+	m.active, m.cursors[panelPublic] = panelPublic, 0
+	mm, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}})
+	m = mm.(model)
+	if _, ok := m.groups["docuseal"]; !ok {
+		t.Fatal("disband from PUBLIC should be rejected, group was deleted")
+	}
+	if !m.statusErr {
+		t.Fatal("expected an error status when disbanding from PUBLIC")
+	}
+
+	// from VAULT: d on the header disbands it
+	m.active, m.cursors[panelVault] = panelVault, 0
+	mm, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}})
+	m = mm.(model)
+	if _, ok := m.groups["docuseal"]; ok {
+		t.Fatal("disband from VAULT should have deleted the group")
+	}
+}
+
 // TestVaultDeleteScope checks the VAULT delete rules build the right rm queue.
 func TestVaultDeleteScope(t *testing.T) {
 	m := newTestModel(t)

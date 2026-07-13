@@ -1122,6 +1122,13 @@ func (m *model) launchAdd() tea.Cmd {
 // prompt (agent-vault's own), sequenced via the rm queue.
 func (m *model) startDelete() tea.Cmd {
 	if r, ok := m.currentRow(); ok && r.group != "" {
+		// disband is global (the group definition is shared), so only the VAULT —
+		// the master library — may do it. From a deployment pane it would wipe the
+		// group everywhere, which is never what you want there.
+		if m.active != panelVault {
+			m.statusMsg, m.statusErr = "disband only from VAULT (the group definition is global)", true
+			return nil
+		}
 		// deleting a group header disbands the group (metadata only) — the keys
 		// themselves are untouched and become ungrouped.
 		delete(m.groups, r.group)
@@ -1585,8 +1592,11 @@ func (m model) renderInfo(width int) string {
 		nameStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("214"))
 		meta := lipgloss.NewStyle().Foreground(lipgloss.Color("245")).
 			Render(fmt.Sprintf("group · %d member(s) · present in: %s", len(m.groups[r.group]), strings.Join(where, ", ")))
-		hint := lipgloss.NewStyle().Foreground(lipgloss.Color("243")).
-			Render("enter open · s/g/p push whole group · d disband")
+		hintText := "enter open · s/g/p push whole group"
+		if m.active == panelVault {
+			hintText += " · d disband"
+		}
+		hint := lipgloss.NewStyle().Foreground(lipgloss.Color("243")).Render(hintText)
 		body = nameStyle.Render("▸ "+r.group) + "\n" + meta + "\n" + hint
 		return lipgloss.NewStyle().
 			Border(lipgloss.NormalBorder()).BorderForeground(lipgloss.Color("244")).
@@ -1755,7 +1765,7 @@ func (m model) renderHelpScreen() string {
 		"    for it (empty name removes it). Adding a key to a group also copies it into VAULT",
 		"    and into every store already holding that group, so a deployed group stays whole.",
 		"    s / g / p on a ▸ header pushes the WHOLE group to VAULT / PUBLIC / PROJECT.",
-		"    d on a ▸ header disbands the group (keys are kept, just ungrouped).",
+		"    d on a ▸ header (VAULT only) disbands the group (keys are kept, just ungrouped).",
 		"",
 		"  Keys (act on the selected entry)",
 		"    s / g / p   COPY → VAULT / PUBLIC / PROJECT",
