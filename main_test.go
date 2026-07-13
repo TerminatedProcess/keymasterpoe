@@ -163,6 +163,10 @@ func TestViewSmoke(t *testing.T) {
 	setKey(t, m, m.publicDir, "alpha-key", "first", "v")
 	m.reload()
 
+	m.groupsPath = filepath.Join(t.TempDir(), "groups.json")
+	m.assignGroup("alpha-key", "letters") // render a group header + info box
+	m.reload()
+
 	mm, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
 	m = mm.(model)
 
@@ -170,13 +174,22 @@ func TestViewSmoke(t *testing.T) {
 		t.Fatal("empty view")
 	}
 	// exercise each mode's prompt + the help screen
-	for _, mode := range []mode{modeNormal, modeFilter, modeAddName, modeAddDesc, modeConfirm} {
+	for _, mode := range []mode{modeNormal, modeFilter, modeAddName, modeAddDesc, modeConfirm, modeWipeConfirm, modeGroupAssign} {
 		m.mode = mode
 		m.pending = pending{kind: "copy", key: "alpha-key", src: panelVault, dst: panelPublic}
+		m.wipeTgt = panelPublic
+		m.groupKey = "beta-key"
 		if out := m.View(); len(out) == 0 {
 			t.Fatalf("empty view in mode %d", mode)
 		}
 	}
+	// drilled-into-group view must render too
+	m.mode = modeNormal
+	m.openGroup[panelVault] = "letters"
+	if out := m.View(); len(out) == 0 {
+		t.Fatal("empty view in opened group")
+	}
+	m.openGroup[panelVault] = ""
 	m.mode = modeNormal
 	m.showHelp = true
 	if out := m.View(); len(out) == 0 {
@@ -286,6 +299,109 @@ func TestSyncBackfillAndConflict(t *testing.T) {
 	m = mm.(model)
 	if renderHash(t, m, m.vaultDir, "diff-key") != renderHash(t, m, m.publicDir, "diff-key") {
 		t.Fatal("override did not replace the VAULT value")
+	}
+}
+
+// TestGroupAssignSaveLoad checks a key can be assigned to a group, the registry
+// persists, and reload reads it back — with one-group-per-key enforced.
+func TestGroupAssignSaveLoad(t *testing.T) {
+	m := newTestModel(t)
+	m.groupsPath = filepath.Join(t.TempDir(), "groups.json")
+	setKey(t, m, m.vaultDir, "docuseal-api-key", "", "v")
+	m.reload()
+
+	m.assignGroup("docuseal-api-key", "docuseal")
+	if err := m.saveGroups(); err != nil {
+		t.Fatal(err)
+	}
+	if got := m.groupOf("docuseal-api-key"); got != "docuseal" {
+		t.Fatalf("groupOf = %q, want docuseal", got)
+	}
+	// reassign to another group must move it, not duplicate
+	m.assignGroup("docuseal-api-key", "billing")
+	if got := m.groupOf("docuseal-api-key"); got != "billing" {
+		t.Fatalf("after reassign groupOf = %q, want billing", got)
+	}
+	if _, ok := m.groups["docuseal"]; ok {
+		t.Fatal("emptied group docuseal should be deleted")
+	}
+
+	// persist + fresh load
+	m.assignGroup("docuseal-api-key", "docuseal")
+	if err := m.saveGroups(); err != nil {
+		t.Fatal(err)
+	}
+	loaded := loadGroups(m.groupsPath)
+	if len(loaded["docuseal"]) != 1 || loaded["docuseal"][0] != "docuseal-api-key" {
+		t.Fatalf("loaded registry wrong: %v", loaded)
+	}
+}
+
+// TestGroupPropagation checks that adding a key to a group copies it into VAULT
+// and into any deployment store that already holds the group.
+func TestGroupPropagation(t *testing.T) {
+	m := newTestModel(t)
+	m.groupsPath = filepath.Join(t.TempDir(), "groups.json")
+	// group already present in PROJECT (one member), plus a loose key in PUBLIC.
+	setKey(t, m, m.projectDir, "docuseal-api-key", "", "v1")
+	setKey(t, m, m.vaultDir, "docuseal-api-key", "", "v1")
+	setKey(t, m, m.publicDir, "docuseal-token", "", "v2") // only in PUBLIC
+	m.reload()
+	m.assignGroup("docuseal-api-key", "docuseal")
+	m.reload()
+
+	// now add docuseal-token to the group → should land in VAULT (master) and in
+	// PROJECT (where the group is deployed), but NOT be forced anywhere else.
+	m.assignGroup("docuseal-token", "docuseal")
+	n, err := m.propagateGroupKey("docuseal-token", "docuseal")
+	if err != nil {
+		t.Fatalf("propagate: %v", err)
+	}
+	m.reload()
+	if !m.names[panelVault]["docuseal-token"] {
+		t.Fatal("token not mirrored into VAULT")
+	}
+	if !m.names[panelProject]["docuseal-token"] {
+		t.Fatal("token not enforced into PROJECT (group already deployed there)")
+	}
+	if n < 2 {
+		t.Fatalf("expected ≥2 propagation copies, got %d", n)
+	}
+}
+
+// TestGroupRowsAndPush checks the collapsed row model and pushing a whole group.
+func TestGroupRowsAndPush(t *testing.T) {
+	m := newTestModel(t)
+	m.groupsPath = filepath.Join(t.TempDir(), "groups.json")
+	setKey(t, m, m.vaultDir, "docuseal-api-key", "", "v")
+	setKey(t, m, m.vaultDir, "docuseal-token", "", "v")
+	setKey(t, m, m.vaultDir, "loose-key", "", "v")
+	m.reload()
+	m.assignGroup("docuseal-api-key", "docuseal")
+	m.assignGroup("docuseal-token", "docuseal")
+	m.reload()
+
+	// collapsed VAULT: one group header + one ungrouped key = 2 rows
+	rows := m.rows(panelVault)
+	if len(rows) != 2 || rows[0].group != "docuseal" || rows[1].key == nil {
+		t.Fatalf("collapsed rows wrong: %+v", rows)
+	}
+	// drill in → two member keys
+	m.openGroup[panelVault] = "docuseal"
+	if got := m.rows(panelVault); len(got) != 2 || got[0].key == nil {
+		t.Fatalf("opened group rows wrong: %+v", got)
+	}
+	m.openGroup[panelVault] = ""
+
+	// push the whole group VAULT → PUBLIC
+	m.active = panelVault
+	m.cursors[panelVault] = 0 // group header
+	m.doPushGroup("docuseal", panelVault, panelPublic)
+	if !m.names[panelPublic]["docuseal-api-key"] || !m.names[panelPublic]["docuseal-token"] {
+		t.Fatal("group push did not copy all members to PUBLIC")
+	}
+	if m.names[panelPublic]["loose-key"] {
+		t.Fatal("push should not have copied the ungrouped key")
 	}
 }
 

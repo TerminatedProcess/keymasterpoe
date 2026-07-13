@@ -96,6 +96,16 @@ Standard Bubble Tea `Init → Update → View`. **Three-pane** model (VAULT / PU
 
 Keybindings: `tab`/`h`/`l`/`←→` switch pane · `j`/`k`/`↑↓` navigate · `/` filter · `s` copy→VAULT (also "update master") · `g` copy→PUBLIC · `p` copy→PROJECT · `S`/`G`/`P` **move** (copy then rm source) · `y` **sync** pane→VAULT · `c` **check** drift · `v` **view+copy** the selected value (detail box + clipboard; opt-in reveal) · `a`/`n` add (auto-mirrors to VAULT) · `d` delete (scope rules above) · `R` refresh all · `?` help · `q`/`esc` quit. Copy is silent (`os/exec`); add/delete/move-rm shell out on a TTY via `tea.ExecProcess`. **Delete has no keymaster modal** — `agent-vault rm` prompts y/n on the TTY itself, so a second confirm would be redundant. Copying onto an existing key confirms (overwrite) in the TUI, since a plain copy is silent. **Reload all three panes after any mutation.**
 
+## Groups (added 2026-07)
+
+An optional organizing layer *on top of* the three stores — agent-vault itself has no groups. A **group** is a named set of key names; **one global definition** lives in `~/.config/keymasterpoe/groups.json` (`{"docuseal": ["docuseal-api-key", ...]}`) and is shown in every pane that holds ≥1 of its member keys. A key belongs to **at most one group**. Membership names are non-secret, so the registry is plain JSON (no value ever involved).
+
+- **Display**: a pane collapses grouped keys under a `▸ <group> (n)` header (n = members present in *that* store), listed above the ungrouped keys. `enter` on a header drills in (the pane shows just that group's member keys); `esc` backs out. `enter` on a key opens the group-assign prompt (type a name to add/create, empty to remove — reassigning moves it, since it's one-group-per-key).
+- **Push a whole group**: `s`/`g`/`p` on a `▸` header copies *every* member present in the focused store to VAULT/PUBLIC/PROJECT at once (silent relay; confirms if it would overwrite existing members). `S`/`G`/`P` (move) stays key-only.
+- **Enforcement / propagation** (`propagateGroupKey`): adding a key to a group copies it into VAULT (master completeness) **and into any deployment store — PUBLIC/PROJECT — that already holds the group**, so a deployed group never goes partial. It is *not* pushed into stores that don't already carry the group. This is the "maintain one group and enforce it across the stores it lives in" rule.
+- **Disband**: `d` on a `▸` header deletes the group definition only (keys are kept, become ungrouped). `d` on a key still deletes the key (scope rules unchanged).
+- **Pruning**: `reload` drops member names that no longer exist in any store and deletes emptied groups, and closes a drilled-in group that lost all its members. Group defs never hold secrets, so this is metadata-only bookkeeping.
+
 ## Testing
 
 Never touch real vaults — use throwaway stores:

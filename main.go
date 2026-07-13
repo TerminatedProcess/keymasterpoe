@@ -59,15 +59,25 @@ const (
 	modeVDelete      // choosing scope for a VAULT delete of a deployed key
 	modeSyncConflict // resolving per-key value overrides during a panel sync
 	modeWipeConfirm  // typing the pane name to confirm wiping a deployment store
+	modeGroupAssign  // typing a group name to add/move the selected key into
 )
 
 // pending records an operation awaiting a y/n confirmation.
 type pending struct {
-	kind string // "copy" | "move" | "delete"
-	key  string
-	desc string
-	src  panel
-	dst  panel
+	kind  string // "copy" | "move" | "pushgroup"
+	key   string
+	desc  string
+	group string // set for "pushgroup"
+	src   panel
+	dst   panel
+}
+
+// rowItem is one line in a pane's list: either a group header (group != "") or a
+// key (key != nil). Collapsed panes show group headers + ungrouped keys; drilling
+// into a group shows that group's member keys present in the store.
+type rowItem struct {
+	group string
+	key   *Key
 }
 
 // afterExec records work to run once a tea.ExecProcess subprocess returns —
@@ -129,6 +139,15 @@ type model struct {
 	// pane wipe: user must type the pane's label to confirm
 	wipeTgt panel
 
+	// grouping: a global registry mapping group name → member key names. A key
+	// belongs to at most one group. openGroup[p] is the group currently drilled
+	// into for pane p ("" = collapsed group view). groupKey is the key awaiting a
+	// group assignment in modeGroupAssign.
+	groups     map[string][]string
+	groupsPath string
+	openGroup  [3]string
+	groupKey   string
+
 	statusMsg string
 	statusErr bool
 }
@@ -143,11 +162,163 @@ func initialModel(avBin string) model {
 		vaultDir:   filepath.Join(home, ".config", "keymasterpoe", "agent-vault", "vault"),
 		publicDir:  filepath.Join(home, ".agent-vault"),
 		projectDir: filepath.Join(cwd, ".agent-vault"),
+		groupsPath: filepath.Join(home, ".config", "keymasterpoe", "groups.json"),
 		cwd:        cwd,
 		avBin:      avBin,
 	}
+	m.groups = loadGroups(m.groupsPath)
 	m.reload()
 	return m
+}
+
+// --- grouping -------------------------------------------------------------
+
+// loadGroups reads the global group registry (group name → key names). Membership
+// is non-secret metadata, safe to hold and persist as plaintext JSON. A missing or
+// unreadable file yields an empty registry.
+func loadGroups(path string) map[string][]string {
+	g := map[string][]string{}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return g
+	}
+	_ = json.Unmarshal(b, &g)
+	if g == nil {
+		g = map[string][]string{}
+	}
+	return g
+}
+
+// saveGroups persists the registry, sorted for a stable on-disk file.
+func (m model) saveGroups() error {
+	if m.groupsPath == "" {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(m.groupsPath), 0o755); err != nil {
+		return err
+	}
+	for g := range m.groups {
+		sort.Strings(m.groups[g])
+	}
+	b, err := json.MarshalIndent(m.groups, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(m.groupsPath, b, 0o644)
+}
+
+// groupOf returns the group a key belongs to, or "" if ungrouped.
+func (m model) groupOf(key string) string {
+	for g, members := range m.groups {
+		for _, k := range members {
+			if k == key {
+				return g
+			}
+		}
+	}
+	return ""
+}
+
+// groupCount reports how many of a group's members actually exist in store p.
+func (m model) groupCount(p panel, group string) int {
+	n := 0
+	for _, k := range m.keys[p] {
+		if m.groupOf(k.Name) == group {
+			n++
+		}
+	}
+	return n
+}
+
+// descOf returns a key's description from whichever store holds it.
+func (m model) descOf(key string) string {
+	for p := 0; p < 3; p++ {
+		for _, k := range m.keys[p] {
+			if k.Name == key {
+				return k.Desc
+			}
+		}
+	}
+	return ""
+}
+
+// assignGroup moves key into group (a key is in at most one group), creating the
+// group if needed and dropping the key from any previous group.
+func (m *model) assignGroup(key, group string) {
+	m.removeFromGroup(key)
+	m.groups[group] = append(m.groups[group], key)
+}
+
+// removeFromGroup drops key from whatever group holds it, deleting the group if it
+// becomes empty.
+func (m *model) removeFromGroup(key string) {
+	for g, members := range m.groups {
+		for i, k := range members {
+			if k == key {
+				m.groups[g] = append(members[:i], members[i+1:]...)
+				if len(m.groups[g]) == 0 {
+					delete(m.groups, g)
+				}
+				return
+			}
+		}
+	}
+}
+
+// pruneGroups drops members that no longer exist in any store and deletes emptied
+// groups. Keeps the registry from accumulating stale names after deletes/moves.
+func (m *model) pruneGroups() {
+	anyStore := func(key string) bool {
+		return m.names[0][key] || m.names[1][key] || m.names[2][key]
+	}
+	for g, members := range m.groups {
+		kept := members[:0]
+		for _, k := range members {
+			if anyStore(k) {
+				kept = append(kept, k)
+			}
+		}
+		if len(kept) == 0 {
+			delete(m.groups, g)
+		} else {
+			m.groups[g] = kept
+		}
+	}
+}
+
+// propagateGroupKey enforces a group's membership across the stores it already
+// lives in: the newly-added key is copied into VAULT (master completeness) and
+// into any deployment store (PUBLIC/PROJECT) that already holds the group, so a
+// deployed group never goes partial. Silent value relay — nothing is revealed.
+func (m *model) propagateGroupKey(key, group string) (int, error) {
+	var srcDir string
+	for _, p := range []panel{panelVault, panelPublic, panelProject} {
+		if m.names[p][key] {
+			srcDir = m.dirFor(p)
+			break
+		}
+	}
+	if srcDir == "" {
+		return 0, nil // key not materialized in any store yet
+	}
+	desc := m.descOf(key)
+	var targets []panel
+	if !m.names[panelVault][key] {
+		targets = append(targets, panelVault)
+	}
+	for _, p := range []panel{panelPublic, panelProject} {
+		if m.groupCount(p, group) > 0 && !m.names[p][key] {
+			targets = append(targets, p)
+		}
+	}
+	n := 0
+	for _, p := range targets {
+		if err := m.copyKeyOp(key, desc, srcDir, m.dirFor(p)); err != nil {
+			return n, err
+		}
+		n++
+	}
+	return n, nil
 }
 
 // --- agent-vault plumbing -------------------------------------------------
@@ -399,6 +570,9 @@ func shredFile(p string) {
 // --- state ----------------------------------------------------------------
 
 func (m *model) reload() {
+	if m.groups == nil {
+		m.groups = map[string][]string{}
+	}
 	m.driftKey, m.driftBad, m.driftText = "", nil, "" // stale after membership changes
 	m.clearReveal()                                   // don't keep plaintext across a reload
 	dirs := [3]string{m.vaultDir, m.publicDir, m.projectDir}
@@ -411,30 +585,71 @@ func (m *model) reload() {
 		}
 		m.names[i] = set
 	}
+	m.pruneGroups()
+	// leave a drilled-in group only if it still has members in that pane
+	for i := 0; i < 3; i++ {
+		if g := m.openGroup[i]; g != "" && m.groupCount(panel(i), g) == 0 {
+			m.openGroup[i] = ""
+		}
+	}
 	m.clampCursors()
 }
 
 func (m *model) clampCursors() {
 	for i := 0; i < 3; i++ {
-		list := m.visible(panel(i))
+		list := m.rows(panel(i))
 		if m.cursors[i] >= len(list) {
 			m.cursors[i] = max(0, len(list)-1)
 		}
 	}
 }
 
-func (m model) visible(p panel) []Key {
-	all := m.keys[p]
-	if m.filterText() == "" {
-		return all
-	}
-	needle := strings.ToLower(m.filterText())
-	out := make([]Key, 0, len(all))
-	for _, k := range all {
-		if strings.Contains(strings.ToLower(k.Name), needle) ||
-			strings.Contains(strings.ToLower(k.Desc), needle) {
-			out = append(out, k)
+// rows builds the display list for a pane. Collapsed: group headers (for groups
+// with ≥1 member present here) followed by ungrouped keys. Drilled into a group:
+// that group's member keys present in the store. The active filter matches group
+// names and key names/descriptions.
+func (m model) rows(p panel) []rowItem {
+	var out []rowItem
+	if open := m.openGroup[p]; open != "" {
+		for i := range m.keys[p] {
+			if m.groupOf(m.keys[p][i].Name) == open {
+				out = append(out, rowItem{key: &m.keys[p][i]})
+			}
 		}
+	} else {
+		present := map[string]bool{}
+		for _, k := range m.keys[p] {
+			if g := m.groupOf(k.Name); g != "" {
+				present[g] = true
+			}
+		}
+		gs := make([]string, 0, len(present))
+		for g := range present {
+			gs = append(gs, g)
+		}
+		sort.Strings(gs)
+		for _, g := range gs {
+			out = append(out, rowItem{group: g})
+		}
+		for i := range m.keys[p] {
+			if m.groupOf(m.keys[p][i].Name) == "" {
+				out = append(out, rowItem{key: &m.keys[p][i]})
+			}
+		}
+	}
+	if needle := strings.ToLower(m.filterText()); needle != "" {
+		filtered := out[:0:0]
+		for _, r := range out {
+			if r.group != "" {
+				if strings.Contains(strings.ToLower(r.group), needle) {
+					filtered = append(filtered, r)
+				}
+			} else if strings.Contains(strings.ToLower(r.key.Name), needle) ||
+				strings.Contains(strings.ToLower(r.key.Desc), needle) {
+				filtered = append(filtered, r)
+			}
+		}
+		out = filtered
 	}
 	return out
 }
@@ -447,16 +662,27 @@ func (m model) filterText() string {
 	return ""
 }
 
-func (m model) selected() *Key {
-	list := m.visible(m.active)
+// currentRow returns the row under the cursor in the active pane.
+func (m model) currentRow() (rowItem, bool) {
+	list := m.rows(m.active)
 	if len(list) == 0 {
-		return nil
+		return rowItem{}, false
 	}
 	idx := m.cursors[m.active]
 	if idx >= len(list) {
 		idx = len(list) - 1
 	}
-	return &list[idx]
+	return list[idx], true
+}
+
+// selected returns the key under the cursor, or nil when the row is a group
+// header (or the pane is empty). Key-level ops guard on this.
+func (m model) selected() *Key {
+	r, ok := m.currentRow()
+	if !ok {
+		return nil
+	}
+	return r.key
 }
 
 // --- bubbletea ------------------------------------------------------------
@@ -515,13 +741,24 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.handleSyncConflictKey(msg)
 	case modeWipeConfirm:
 		return m.handleWipeKey(msg)
+	case modeGroupAssign:
+		return m.handleGroupAssignKey(msg)
 	}
 
 	m.statusMsg, m.statusErr = "", false
 
 	switch msg.String() {
-	case "q", "esc", "ctrl+c":
+	case "q", "ctrl+c":
 		return m, tea.Quit
+	case "esc":
+		// esc first backs out of a drilled-in group; otherwise quits.
+		if m.openGroup[m.active] != "" {
+			m.openGroup[m.active], m.cursors[m.active] = "", 0
+			return m, nil
+		}
+		return m, tea.Quit
+	case "enter":
+		return m.handleEnter()
 	case "?":
 		m.showHelp = true
 	case "/":
@@ -532,7 +769,7 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "shift+tab", "h", "left":
 		m.active = (m.active + 2) % 3
 	case "j", "down":
-		if list := m.visible(m.active); m.cursors[m.active] < len(list)-1 {
+		if list := m.rows(m.active); m.cursors[m.active] < len(list)-1 {
 			m.cursors[m.active]++
 		}
 	case "k", "up":
@@ -543,11 +780,11 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.reload()
 		m.statusMsg = "reloaded"
 	case "s":
-		return m, m.startCopy(panelVault)
+		return m, m.startCopyOrPush(panelVault)
 	case "g":
-		return m, m.startCopy(panelPublic)
+		return m, m.startCopyOrPush(panelPublic)
 	case "p":
-		return m, m.startCopy(panelProject)
+		return m, m.startCopyOrPush(panelProject)
 	case "S":
 		return m, m.startMove(panelVault)
 	case "G":
@@ -650,6 +887,8 @@ func (m model) handleConfirmKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, m.doCopy(p.key, p.desc, p.src, p.dst)
 		case "move":
 			return m, m.doMove(p.key, p.desc, p.src, p.dst)
+		case "pushgroup":
+			return m, m.doPushGroup(p.group, p.src, p.dst)
 		}
 	default:
 		m.mode = modeNormal
@@ -659,6 +898,135 @@ func (m model) handleConfirmKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 // --- operations -----------------------------------------------------------
+
+// startCopyOrPush routes s/g/p: on a group header it pushes the whole group, on a
+// key it copies that one key.
+func (m *model) startCopyOrPush(dst panel) tea.Cmd {
+	if r, ok := m.currentRow(); ok && r.group != "" {
+		return m.startPushGroup(r.group, dst)
+	}
+	return m.startCopy(dst)
+}
+
+// handleEnter drills into a group header, or opens the group-assign prompt for a
+// key.
+func (m model) handleEnter() (tea.Model, tea.Cmd) {
+	r, ok := m.currentRow()
+	if !ok {
+		return m, nil
+	}
+	if r.group != "" {
+		m.openGroup[m.active], m.cursors[m.active] = r.group, 0
+		return m, nil
+	}
+	m.groupKey, m.input, m.mode = r.key.Name, "", modeGroupAssign
+	return m, nil
+}
+
+// startPushGroup copies every member of a group that exists in the active store
+// into dst, so the whole group lands together. Confirms if any member would be
+// overwritten in dst.
+func (m *model) startPushGroup(group string, dst panel) tea.Cmd {
+	if dst == m.active {
+		m.statusMsg, m.statusErr = "source and target are the same store", true
+		return nil
+	}
+	if m.groupCount(m.active, group) == 0 {
+		m.statusMsg, m.statusErr = fmt.Sprintf("group %s has no keys in %s", group, labelFor(m.active)), true
+		return nil
+	}
+	for _, k := range m.keys[m.active] {
+		if m.groupOf(k.Name) == group && m.names[dst][k.Name] {
+			m.mode = modeConfirm
+			m.pending = pending{kind: "pushgroup", group: group, src: m.active, dst: dst}
+			return nil
+		}
+	}
+	return m.doPushGroup(group, m.active, dst)
+}
+
+func (m *model) doPushGroup(group string, src, dst panel) tea.Cmd {
+	var pushed, failed int
+	for _, k := range m.keys[src] {
+		if m.groupOf(k.Name) != group {
+			continue
+		}
+		if err := m.copyKeyOp(k.Name, k.Desc, m.dirFor(src), m.dirFor(dst)); err != nil {
+			failed++
+			continue
+		}
+		pushed++
+	}
+	m.reload()
+	if failed > 0 {
+		m.statusMsg, m.statusErr = fmt.Sprintf("pushed %d of group %s → %s, %d failed", pushed, group, labelFor(dst), failed), true
+	} else {
+		m.statusMsg = fmt.Sprintf("pushed group %s (%d keys) → %s", group, pushed, labelFor(dst))
+	}
+	return nil
+}
+
+// handleGroupAssignKey resolves the group-assign prompt: a typed name adds/moves
+// the key into that group (creating it if new) and propagates the key to the
+// stores that already hold the group; an empty name removes the key from its
+// current group.
+func (m model) handleGroupAssignKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc", "ctrl+c":
+		m.mode, m.input = modeNormal, ""
+		m.statusMsg = "cancelled"
+	case "enter":
+		name := strings.TrimSpace(m.input)
+		key := m.groupKey
+		m.mode, m.input = modeNormal, ""
+		if name == "" {
+			if g := m.groupOf(key); g != "" {
+				m.removeFromGroup(key)
+				if err := m.saveGroups(); err != nil {
+					m.statusMsg, m.statusErr = "save groups failed: "+err.Error(), true
+					return m, nil
+				}
+				m.reload()
+				m.statusMsg = fmt.Sprintf("removed %s from group %s", key, g)
+			} else {
+				m.statusMsg = "no group name entered"
+			}
+			return m, nil
+		}
+		if !keyNameRe.MatchString(name) {
+			m.statusMsg, m.statusErr = "invalid group name (use lowercase a-z, 0-9, -)", true
+			return m, nil
+		}
+		m.assignGroup(key, name)
+		if err := m.saveGroups(); err != nil {
+			m.statusMsg, m.statusErr = "save groups failed: "+err.Error(), true
+			return m, nil
+		}
+		n, err := m.propagateGroupKey(key, name)
+		if err != nil {
+			m.reload()
+			m.statusMsg, m.statusErr = fmt.Sprintf("added to %s, but propagate failed: %v", name, err), true
+			return m, nil
+		}
+		m.reload()
+		if n > 0 {
+			m.statusMsg = fmt.Sprintf("added %s to group %s (enforced into %d store(s))", key, name, n)
+		} else {
+			m.statusMsg = fmt.Sprintf("added %s to group %s", key, name)
+		}
+	case "backspace":
+		if len(m.input) > 0 {
+			m.input = m.input[:len(m.input)-1]
+		}
+	case "ctrl+u":
+		m.input = ""
+	default:
+		if r := msg.Runes; len(r) > 0 {
+			m.input += string(r)
+		}
+	}
+	return m, nil
+}
 
 func (m *model) startCopy(dst panel) tea.Cmd {
 	if dst == m.active {
@@ -678,6 +1046,10 @@ func (m *model) startCopy(dst panel) tea.Cmd {
 }
 
 func (m *model) startMove(dst panel) tea.Cmd {
+	if r, ok := m.currentRow(); ok && r.group != "" {
+		m.statusMsg, m.statusErr = "move applies to a single key — use s/g/p to push a whole group", true
+		return nil
+	}
 	if dst == m.active {
 		m.statusMsg, m.statusErr = "source and target are the same store", true
 		return nil
@@ -742,6 +1114,19 @@ func (m *model) launchAdd() tea.Cmd {
 // PROJECT deployment offers vault-only or both. Each `rm` is a separate TTY
 // prompt (agent-vault's own), sequenced via the rm queue.
 func (m *model) startDelete() tea.Cmd {
+	if r, ok := m.currentRow(); ok && r.group != "" {
+		// deleting a group header disbands the group (metadata only) — the keys
+		// themselves are untouched and become ungrouped.
+		delete(m.groups, r.group)
+		if err := m.saveGroups(); err != nil {
+			m.statusMsg, m.statusErr = "save groups failed: "+err.Error(), true
+			return nil
+		}
+		m.openGroup[m.active] = ""
+		m.reload()
+		m.statusMsg = fmt.Sprintf("disbanded group %s (keys kept)", r.group)
+		return nil
+	}
 	k := m.selected()
 	if k == nil {
 		return nil
@@ -994,7 +1379,7 @@ func (m model) View() string {
 
 func (m model) renderPanel(p panel, subtitle string, width, listHeight int) string {
 	isActive := m.active == p
-	list := m.visible(p)
+	list := m.rows(p)
 	total := len(m.keys[p])
 
 	var color lipgloss.Color
@@ -1017,9 +1402,18 @@ func (m model) renderPanel(p panel, subtitle string, width, listHeight int) stri
 	}
 	header := center(color, true).Render(labelFor(p))
 	sub := center(lipgloss.Color("243"), false).Render(subtitle)
-	countText := fmt.Sprintf("(%d keys)", len(list))
-	if m.filterText() != "" {
-		countText = fmt.Sprintf("(%d / %d keys)", len(list), total)
+	var countText string
+	switch {
+	case m.openGroup[p] != "":
+		countText = fmt.Sprintf("▸ %s (%d)  esc back", m.openGroup[p], m.groupCount(p, m.openGroup[p]))
+	case m.filterText() != "":
+		countText = fmt.Sprintf("(%d shown / %d keys)", len(list), total)
+	default:
+		if ng := numGroups(list); ng > 0 {
+			countText = fmt.Sprintf("(%d keys · %d groups)", total, ng)
+		} else {
+			countText = fmt.Sprintf("(%d keys)", total)
+		}
 	}
 	count := center(lipgloss.Color("243"), false).Render(countText)
 
@@ -1044,7 +1438,12 @@ func (m model) renderPanel(p panel, subtitle string, width, listHeight int) stri
 			scroll = cursor - visibleItems + 1
 		}
 		for i := scroll; i < len(list) && i < scroll+visibleItems; i++ {
-			items = append(items, m.renderRow(list[i], p, isActive && i == cursor, width))
+			sel := isActive && i == cursor
+			if list[i].group != "" {
+				items = append(items, m.renderGroupRow(list[i].group, p, sel, width))
+			} else {
+				items = append(items, m.renderRow(*list[i].key, p, sel, width))
+			}
 		}
 	}
 	for len(items) < visibleItems {
@@ -1056,6 +1455,45 @@ func (m model) renderPanel(p panel, subtitle string, width, listHeight int) stri
 		Border(border).BorderForeground(color).
 		Width(width).Height(listHeight).Padding(0, 1).
 		Render(content)
+}
+
+// numGroups counts the group-header rows in a rendered list.
+func numGroups(list []rowItem) int {
+	n := 0
+	for _, r := range list {
+		if r.group != "" {
+			n++
+		}
+	}
+	return n
+}
+
+// renderGroupRow draws a group header: a ▸ disclosure marker, the group name in
+// the pane color, and how many member keys live in this store.
+func (m model) renderGroupRow(group string, p panel, selected bool, width int) string {
+	var color lipgloss.Color
+	switch p {
+	case panelVault:
+		color = lipgloss.Color("214")
+	case panelPublic:
+		color = lipgloss.Color("82")
+	default:
+		color = lipgloss.Color("141")
+	}
+	count := fmt.Sprintf(" (%d)", m.groupCount(p, group))
+	label := "▸ " + group
+	textW := width - 4 - len([]rune(count))
+	if r := []rune(label); len(r) > textW {
+		label = string(r[:textW-1]) + "…"
+	}
+	style := lipgloss.NewStyle().Bold(true).Width(width - 4 - len([]rune(count)))
+	if selected {
+		style = style.Background(lipgloss.Color("236")).Foreground(lipgloss.Color("231"))
+	} else {
+		style = style.Foreground(color)
+	}
+	countStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("243"))
+	return style.Render(label) + countStyle.Render(count)
 }
 
 // renderRow draws one key with a 2-slot indicator prefix. Fixed color language:
@@ -1130,6 +1568,24 @@ func (m model) renderInfo(width int) string {
 		inner = 10
 	}
 	var body string
+	if r, ok := m.currentRow(); ok && r.group != "" {
+		var where []string
+		for i := 0; i < 3; i++ {
+			if c := m.groupCount(panel(i), r.group); c > 0 {
+				where = append(where, fmt.Sprintf("%s:%d", labelFor(panel(i)), c))
+			}
+		}
+		nameStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("214"))
+		meta := lipgloss.NewStyle().Foreground(lipgloss.Color("245")).
+			Render(fmt.Sprintf("group · %d member(s) · present in: %s", len(m.groups[r.group]), strings.Join(where, ", ")))
+		hint := lipgloss.NewStyle().Foreground(lipgloss.Color("243")).
+			Render("enter open · s/g/p push whole group · d disband")
+		body = nameStyle.Render("▸ "+r.group) + "\n" + meta + "\n" + hint
+		return lipgloss.NewStyle().
+			Border(lipgloss.NormalBorder()).BorderForeground(lipgloss.Color("244")).
+			Width(width - 2).Height(6).Padding(0, 1).
+			Render(body)
+	}
 	if k := m.selected(); k == nil {
 		body = lipgloss.NewStyle().Foreground(lipgloss.Color("243")).Render("(no key selected)")
 	} else {
@@ -1145,7 +1601,11 @@ func (m model) renderInfo(width int) string {
 		}
 		nameStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("15"))
 		descStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("202")).Width(inner).MaxHeight(2)
-		meta := lipgloss.NewStyle().Foreground(lipgloss.Color("245")).Render("in: " + strings.Join(in, ", "))
+		metaText := "in: " + strings.Join(in, ", ")
+		if g := m.groupOf(k.Name); g != "" {
+			metaText += "    group: " + g
+		}
+		meta := lipgloss.NewStyle().Foreground(lipgloss.Color("245")).Render(metaText)
 		if m.driftKey == k.Name && m.driftText != "" {
 			c := lipgloss.Color("120") // green-ish: compared, no diff
 			if len(m.driftBad) > 0 {
@@ -1202,6 +1662,8 @@ func (m model) renderPrompt(width int) string {
 			q = fmt.Sprintf("overwrite %s in %s?", m.pending.key, labelFor(m.pending.dst))
 		case "move":
 			q = fmt.Sprintf("overwrite %s in %s and remove from %s?", m.pending.key, labelFor(m.pending.dst), labelFor(m.pending.src))
+		case "pushgroup":
+			q = fmt.Sprintf("push group %s → %s overwrites existing member keys there?", m.pending.group, labelFor(m.pending.dst))
 		}
 		warn := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("196")).Render(q)
 		return style.Render(warn + hint("  (y/n)"))
@@ -1230,6 +1692,17 @@ func (m model) renderPrompt(width int) string {
 		warn := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("196")).
 			Render(fmt.Sprintf("WIPE all %d key(s) from %s — type %s to confirm: ", len(m.keys[m.wipeTgt]), lbl, lbl))
 		return style.Render(warn + m.input + cursor + hint("  (enter confirm · esc cancel)"))
+	case modeGroupAssign:
+		existing := make([]string, 0, len(m.groups))
+		for g := range m.groups {
+			existing = append(existing, g)
+		}
+		sort.Strings(existing)
+		h := "  (enter: add/create · empty: remove from group · esc cancel)"
+		if len(existing) > 0 {
+			h = "  (groups: " + strings.Join(existing, " ") + ")"
+		}
+		return style.Render(label(fmt.Sprintf("group for %s: ", m.groupKey)) + m.input + cursor + hint(h))
 	}
 	if m.filterActive && m.filter != "" {
 		return style.Render(label("filter: ") + m.filter + hint("  (/ edit · esc clear)"))
@@ -1251,7 +1724,7 @@ func (m model) renderStatus(width int) string {
 
 func (m model) renderHelpBar(width int) string {
 	return lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("202")).Padding(0, 1).Width(width).
-		Render("jk nav  tab panes  / filter  s/g/p copy  S/G/P move  y sync→V  c check  v view+copy  a add  d delete  W wipe  R reload  ? help  q quit")
+		Render("jk nav  tab panes  enter group/open  / filter  s/g/p copy·push  S/G/P move  y sync→V  c check  v view+copy  a add  d del/disband  W wipe  R reload  ? help  q quit")
 }
 
 func (m model) renderHelpScreen() string {
@@ -1266,7 +1739,16 @@ func (m model) renderHelpScreen() string {
 		"  Navigation",
 		"    j / k / ↑ / ↓      move within a pane",
 		"    tab / h / l / ← →  switch pane",
+		"    enter              open a group (drill in) · on a key: assign it to a group",
+		"    esc                back out of an opened group (or quit)",
 		"    /                  fuzzy-filter the focused pane (esc clears)",
+		"",
+		"  Groups (one global definition, shown in every pane that holds the keys)",
+		"    A group collapses its keys under a ▸ header. enter on a key names/creates a group",
+		"    for it (empty name removes it). Adding a key to a group also copies it into VAULT",
+		"    and into every store already holding that group, so a deployed group stays whole.",
+		"    s / g / p on a ▸ header pushes the WHOLE group to VAULT / PUBLIC / PROJECT.",
+		"    d on a ▸ header disbands the group (keys are kept, just ungrouped).",
 		"",
 		"  Keys (act on the selected entry)",
 		"    s / g / p   COPY → VAULT / PUBLIC / PROJECT",
