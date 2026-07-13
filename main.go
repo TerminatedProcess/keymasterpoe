@@ -760,14 +760,14 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, tea.Quit
 	case "enter":
 		return m.handleEnter()
-	case "?":
+	case "?", "h":
 		m.showHelp = true
 	case "/":
 		m.mode = modeFilter
 		m.filterActive = true
 	case "tab", "l", "right":
 		m.active = (m.active + 1) % 3
-	case "shift+tab", "h", "left":
+	case "shift+tab", "left":
 		m.active = (m.active + 2) % 3
 	case "j", "down":
 		if list := m.rows(m.active); m.cursors[m.active] < len(list)-1 {
@@ -1378,13 +1378,12 @@ func (m model) View() string {
 	info := m.renderInfo(m.width)
 	prompt := m.renderPrompt(m.width)
 	status := m.renderStatus(m.width)
-	help := m.renderHelpBar(m.width)
 
 	panelWidth := (m.width - 4) / 3
 	if panelWidth < 20 {
 		panelWidth = 20
 	}
-	listHeight := m.height - lipgloss.Height(info) - lipgloss.Height(prompt) - 4
+	listHeight := m.height - lipgloss.Height(info) - lipgloss.Height(prompt) - 3
 	if listHeight < 5 {
 		listHeight = 5
 	}
@@ -1394,7 +1393,7 @@ func (m model) View() string {
 	project := m.renderPanel(panelProject, "./.agent-vault", panelWidth, listHeight)
 
 	panels := lipgloss.JoinHorizontal(lipgloss.Top, vault, " ", public, " ", project)
-	return lipgloss.JoinVertical(lipgloss.Left, info, prompt, panels, status, help)
+	return lipgloss.JoinVertical(lipgloss.Left, info, prompt, panels, status)
 }
 
 func (m model) renderPanel(p panel, subtitle string, width, listHeight int) string {
@@ -1736,18 +1735,14 @@ func (m model) renderPrompt(width int) string {
 func (m model) renderStatus(width int) string {
 	style := lipgloss.NewStyle().Padding(0, 1).Width(width)
 	if m.statusMsg == "" {
-		return style.Render(" ")
+		// idle: a quiet, single-line affordance instead of the old command bar.
+		return style.Foreground(lipgloss.Color("243")).Render("h — help    q — quit")
 	}
 	color := lipgloss.Color("82")
 	if m.statusErr {
 		color = lipgloss.Color("196")
 	}
 	return style.Foreground(color).Render(m.statusMsg)
-}
-
-func (m model) renderHelpBar(width int) string {
-	return lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("202")).Padding(0, 1).Width(width).
-		Render("jk nav  tab panes  enter group/open  / filter  s/g/p copy·push  S/G/P move  y sync→V  c check  v view+copy  a add  d del/disband  W wipe  R reload  ? help  q quit")
 }
 
 func (m model) renderHelpScreen() string {
@@ -1761,7 +1756,7 @@ func (m model) renderHelpScreen() string {
 		"",
 		"  Navigation",
 		"    j / k / ↑ / ↓      move within a pane",
-		"    tab / h / l / ← →  switch pane",
+		"    tab / l / → · shift+tab / ← · switch pane (next / prev)",
 		"    enter              open a group (drill in) · on a VAULT key: assign it to a group",
 		"    esc                back out of an opened group (or quit)",
 		"    /                  fuzzy-filter the focused pane (esc clears)",
@@ -1785,7 +1780,7 @@ func (m model) renderHelpScreen() string {
 		"                or cancel); PROJECT lets you keep or delete the deployment.",
 		"    W           WIPE every key from the focused deployment pane (PUBLIC/PROJECT only; type the",
 		"                pane name to confirm). The VAULT master can never be wiped.",
-		"    R           reload all panes    ?  this help    q / esc  quit",
+		"    R           reload all panes    h / ?  this help    q / esc  quit",
 		"",
 		"  Indicators (left of each key) — the VAULT holds keys; PUBLIC/PROJECT are deployments:",
 		"    VAULT row:     " + lipgloss.NewStyle().Foreground(lipgloss.Color("82")).Render("●") + " deployed to PUBLIC   " +
