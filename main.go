@@ -109,6 +109,13 @@ type model struct {
 	driftBad  map[panel]bool // stores whose value differs from the baseline
 	driftText string        // summary line for the detail box
 
+	// on-demand value reveal for the selected key (breaks the never-reveal
+	// invariant deliberately — user opt-in). Keyed to a specific key+pane so it
+	// hides again the moment you navigate away; cleared on any reload.
+	revealKey   string // key the revealed value is for ("" = none)
+	revealPanel panel  // store the value was read from
+	revealVal   string // plaintext value (only while revealed)
+
 	// sequential rm queue for a multi-store VAULT delete
 	rmQueue []panel
 	rmKey   string
@@ -269,6 +276,78 @@ func (m model) valueHash(dir, key string) (string, error) {
 	return f[0], nil
 }
 
+// revealValue renders a key's plaintext value into a 0600 temp (the sanctioned
+// agent-vault write relay), reads it, and shreds the temp. UNLIKE valueHash, the
+// plaintext DOES enter this process — this is the deliberate opt-in relaxation of
+// the never-reveal invariant for the `v` view/copy feature. Trailing newline (if
+// agent-vault appended one) is trimmed so clipboard/detail get the exact value.
+func (m model) revealValue(dir, key string) (string, error) {
+	tmp, err := os.CreateTemp("", "km-*")
+	if err != nil {
+		return "", err
+	}
+	p := tmp.Name()
+	tmp.Close()
+	defer shredFile(p)
+	if err := m.av(dir, "write", p, "--content", "<agent-vault:"+key+">").Run(); err != nil {
+		return "", fmt.Errorf("render: %w", err)
+	}
+	b, err := os.ReadFile(p)
+	if err != nil {
+		return "", fmt.Errorf("read: %w", err)
+	}
+	return strings.TrimRight(string(b), "\n"), nil
+}
+
+// copyClipboard pipes a value to the system clipboard. Wayland (wl-copy) first,
+// then X11 fallbacks. Value transits the child's stdin only — never a temp file.
+func copyClipboard(val string) error {
+	type tool struct {
+		bin  string
+		args []string
+	}
+	for _, t := range []tool{
+		{"wl-copy", nil},
+		{"xclip", []string{"-selection", "clipboard"}},
+		{"xsel", []string{"--clipboard", "--input"}},
+	} {
+		if _, err := exec.LookPath(t.bin); err != nil {
+			continue
+		}
+		c := exec.Command(t.bin, t.args...)
+		c.Stdin = strings.NewReader(val)
+		if err := c.Run(); err != nil {
+			return fmt.Errorf("%s: %w", t.bin, err)
+		}
+		return nil
+	}
+	return fmt.Errorf("no clipboard tool found (install wl-clipboard, xclip, or xsel)")
+}
+
+// doReveal reads the selected key's value from the active pane, stashes it for
+// the detail box, and copies it to the clipboard.
+func (m *model) doReveal() {
+	k := m.selected()
+	if k == nil {
+		m.statusMsg, m.statusErr = "no key selected", true
+		return
+	}
+	val, err := m.revealValue(m.dirFor(m.active), k.Name)
+	if err != nil {
+		m.statusMsg, m.statusErr = fmt.Sprintf("reveal failed: %v", err), true
+		return
+	}
+	m.revealKey, m.revealPanel, m.revealVal = k.Name, m.active, val
+	if err := copyClipboard(val); err != nil {
+		m.statusMsg, m.statusErr = fmt.Sprintf("revealed — clipboard failed: %v", err), true
+		return
+	}
+	m.statusMsg, m.statusErr = fmt.Sprintf("%s value revealed + copied to clipboard", k.Name), false
+}
+
+// clearReveal drops any revealed plaintext from memory.
+func (m *model) clearReveal() { m.revealKey, m.revealVal = "", "" }
+
 // checkDrift fingerprints the key across every store it's in and records which
 // stores differ from the baseline (VAULT if present, else the first store).
 func (m *model) checkDrift(key string) {
@@ -317,6 +396,7 @@ func shredFile(p string) {
 
 func (m *model) reload() {
 	m.driftKey, m.driftBad, m.driftText = "", nil, "" // stale after membership changes
+	m.clearReveal()                                   // don't keep plaintext across a reload
 	dirs := [3]string{m.vaultDir, m.publicDir, m.projectDir}
 	for i, d := range dirs {
 		m.exists[i] = storeExists(d)
@@ -480,6 +560,8 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	case "y":
 		return m, m.startSync()
+	case "v":
+		m.doReveal()
 	}
 	return m, nil
 }
@@ -993,12 +1075,28 @@ func (m model) renderInfo(width int) string {
 			}
 			meta += lipgloss.NewStyle().Foreground(c).Render("    " + m.driftText)
 		}
+		// Value line: revealed plaintext (keyed to this exact key+pane) or a
+		// dim affordance. Truncated to the box width — the clipboard got the full
+		// value; this is only a visual echo.
+		var valLine string
+		if m.revealKey == k.Name && m.revealPanel == m.active && m.names[m.active][k.Name] {
+			shown := m.revealVal
+			if r := []rune(shown); len(r) > inner-9 {
+				shown = string(r[:inner-10]) + "…"
+			}
+			valLine = lipgloss.NewStyle().Foreground(lipgloss.Color("220")).Render("value: ") +
+				lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("46")).Render(shown) +
+				lipgloss.NewStyle().Foreground(lipgloss.Color("243")).Render("  (copied)")
+		} else {
+			valLine = lipgloss.NewStyle().Foreground(lipgloss.Color("243")).
+				Render("value: •••••••  (v — reveal & copy to clipboard)")
+		}
 		body = nameStyle.Render(k.Name) + "\n" +
-			descStyle.Render(desc) + "\n" + meta
+			descStyle.Render(desc) + "\n" + meta + "\n" + valLine
 	}
 	return lipgloss.NewStyle().
 		Border(lipgloss.NormalBorder()).BorderForeground(lipgloss.Color("244")).
-		Width(width - 2).Height(5).Padding(0, 1).
+		Width(width - 2).Height(6).Padding(0, 1).
 		Render(body)
 }
 
@@ -1070,7 +1168,7 @@ func (m model) renderStatus(width int) string {
 
 func (m model) renderHelpBar(width int) string {
 	return lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("202")).Padding(0, 1).Width(width).
-		Render("jk nav  tab panes  / filter  s/g/p copy  S/G/P move  y sync→V  c check  a add  d delete  R reload  ? help  q quit")
+		Render("jk nav  tab panes  / filter  s/g/p copy  S/G/P move  y sync→V  c check  v view+copy  a add  d delete  R reload  ? help  q quit")
 }
 
 func (m model) renderHelpScreen() string {
@@ -1092,6 +1190,7 @@ func (m model) renderHelpScreen() string {
 		"    S / G / P   MOVE → VAULT / PUBLIC / PROJECT (copy, then remove source)",
 		"    y           SYNC the focused deployment pane → VAULT (backfill + resolve value conflicts)",
 		"    c           CHECK drift: fingerprint-compare the selected key's value across stores",
+		"    v           VIEW the selected key's value in the detail box AND copy it to the clipboard",
 		"    a / n       ADD a new key here (also mirrored into VAULT)",
 		"    d           DELETE — deployment pane: that copy only. VAULT: can't orphan PUBLIC (delete both",
 		"                or cancel); PROJECT lets you keep or delete the deployment.",
@@ -1107,8 +1206,8 @@ func (m model) renderHelpScreen() string {
 		"",
 		"  Copying onto an existing key overwrites it (confirm first) — that's how you update the VAULT master.",
 		"",
-		lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Render("  keymaster NEVER reveals a value. To view one, run"),
-		lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Render("  `agent-vault get <key> --reveal` yourself, outside this tool."),
+		lipgloss.NewStyle().Foreground(lipgloss.Color("214")).Render("  `v` reveals a value (in the detail box + clipboard) — it briefly enters"),
+		lipgloss.NewStyle().Foreground(lipgloss.Color("214")).Render("  memory. Copy/move/drift never reveal; they relay via shredded temp files."),
 		"",
 		lipgloss.NewStyle().Foreground(lipgloss.Color("243")).Render("  press any key to return"),
 	}
