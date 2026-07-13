@@ -405,9 +405,9 @@ func TestGroupRowsAndPush(t *testing.T) {
 	}
 }
 
-// TestDisbandVaultOnly checks a group can be disbanded from VAULT but not from a
-// deployment pane (the definition is global).
-func TestDisbandVaultOnly(t *testing.T) {
+// TestUngroupVaultOnly checks a group can be ungrouped (u) from VAULT but not from
+// a deployment pane — and that the keys survive.
+func TestUngroupVaultOnly(t *testing.T) {
 	m := newTestModel(t)
 	m.groupsPath = filepath.Join(t.TempDir(), "groups.json")
 	setKey(t, m, m.vaultDir, "docuseal-api-key", "", "v")
@@ -416,23 +416,55 @@ func TestDisbandVaultOnly(t *testing.T) {
 	m.assignGroup("docuseal-api-key", "docuseal")
 	m.reload()
 
-	// from PUBLIC: d on the header must be rejected, group intact
+	// from PUBLIC: u on the header must be rejected, group intact
 	m.active, m.cursors[panelPublic] = panelPublic, 0
-	mm, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}})
+	mm, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'u'}})
 	m = mm.(model)
 	if _, ok := m.groups["docuseal"]; !ok {
-		t.Fatal("disband from PUBLIC should be rejected, group was deleted")
+		t.Fatal("ungroup from PUBLIC should be rejected, group was deleted")
 	}
 	if !m.statusErr {
-		t.Fatal("expected an error status when disbanding from PUBLIC")
+		t.Fatal("expected an error status when ungrouping from PUBLIC")
 	}
 
-	// from VAULT: d on the header disbands it
+	// from VAULT: u on the header ungroups it, key kept
 	m.active, m.cursors[panelVault] = panelVault, 0
-	mm, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}})
+	mm, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'u'}})
 	m = mm.(model)
 	if _, ok := m.groups["docuseal"]; ok {
-		t.Fatal("disband from VAULT should have deleted the group")
+		t.Fatal("ungroup from VAULT should have dropped the group definition")
+	}
+	if !m.names[panelVault]["docuseal-api-key"] {
+		t.Fatal("ungroup must keep the underlying key")
+	}
+}
+
+// TestGroupDeleteEverywhere checks d on a group header from VAULT deletes all its
+// member keys across every store.
+func TestGroupDeleteEverywhere(t *testing.T) {
+	m := newTestModel(t)
+	m.groupsPath = filepath.Join(t.TempDir(), "groups.json")
+	setKey(t, m, m.vaultDir, "docuseal-api-key", "", "v")
+	setKey(t, m, m.publicDir, "docuseal-api-key", "", "v")
+	setKey(t, m, m.vaultDir, "docuseal-token", "", "v")
+	m.reload()
+	m.assignGroup("docuseal-api-key", "docuseal")
+	m.assignGroup("docuseal-token", "docuseal")
+	m.reload()
+
+	m.active, m.cursors[panelVault] = panelVault, 0
+	m.startDelete()
+	if m.pending.kind != "delgroup" {
+		t.Fatalf("expected delgroup confirm, got %q", m.pending.kind)
+	}
+	mm, _ := m.handleConfirmKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	m = mm.(model)
+	if m.names[panelVault]["docuseal-api-key"] || m.names[panelVault]["docuseal-token"] ||
+		m.names[panelPublic]["docuseal-api-key"] {
+		t.Fatal("group delete-everywhere left keys behind")
+	}
+	if _, ok := m.groups["docuseal"]; ok {
+		t.Fatal("emptied group definition should be pruned")
 	}
 }
 
@@ -466,24 +498,74 @@ func TestGroupAssignVaultOnly(t *testing.T) {
 	}
 }
 
-// TestVaultDeleteScope checks the VAULT delete rules build the right rm queue.
-func TestVaultDeleteScope(t *testing.T) {
+// TestDeleteFromVaultCascades checks a VAULT delete removes the key from every
+// store (VAULT + PUBLIC + PROJECT) via the silent file-level path.
+func TestDeleteFromVaultCascades(t *testing.T) {
 	m := newTestModel(t)
 	setKey(t, m, m.vaultDir, "k", "", "v")
-	setKey(t, m, m.projectDir, "k", "", "v") // deployed to PROJECT only
+	setKey(t, m, m.publicDir, "k", "", "v")
+	setKey(t, m, m.projectDir, "k", "", "v")
 	m.reload()
-	m.active = panelVault
-	m.cursors[panelVault] = 0
-	m.startDelete() // deployed → should enter scope modal, not delete yet
-	if m.mode != modeVDelete {
-		t.Fatalf("expected modeVDelete for a deployed vault key, got %d", m.mode)
+	m.active, m.cursors[panelVault] = panelVault, 0
+
+	m.startDelete()
+	if m.mode != modeConfirm || m.pending.kind != "del" {
+		t.Fatalf("expected a del confirm, got mode=%d kind=%q", m.mode, m.pending.kind)
 	}
-	// choose "vault only" → queue is just VAULT
-	m.rmKey = "k"
-	mm, _ := m.handleVDeleteKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'v'}})
+	mm, _ := m.handleConfirmKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
 	m = mm.(model)
-	// after runRmQueue pops VAULT, queue is drained (rm itself runs via ExecProcess)
-	if len(m.rmQueue) != 0 {
-		t.Fatalf("expected queue drained to 0 after popping VAULT, got %v", m.rmQueue)
+	if m.names[panelVault]["k"] || m.names[panelPublic]["k"] || m.names[panelProject]["k"] {
+		t.Fatalf("VAULT delete should cascade everywhere; still present: %v", m.names)
+	}
+}
+
+// TestDeleteFromDeploymentPaneOnly checks deleting from PUBLIC leaves VAULT intact.
+func TestDeleteFromDeploymentPaneOnly(t *testing.T) {
+	m := newTestModel(t)
+	setKey(t, m, m.vaultDir, "k", "", "v")
+	setKey(t, m, m.publicDir, "k", "", "v")
+	m.reload()
+	m.active, m.cursors[panelPublic] = panelPublic, 0
+
+	m.startDelete()
+	mm, _ := m.handleConfirmKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	m = mm.(model)
+	if m.names[panelPublic]["k"] {
+		t.Fatal("key should be gone from PUBLIC")
+	}
+	if !m.names[panelVault]["k"] {
+		t.Fatal("PUBLIC delete must not touch the VAULT copy")
+	}
+}
+
+// TestReconcileProjectPrunesStale checks startup reconcile drops PROJECT keys
+// whose VAULT copy is gone, but keeps ones still in VAULT.
+func TestReconcileProjectPrunesStale(t *testing.T) {
+	m := newTestModel(t)
+	setKey(t, m, m.vaultDir, "live", "", "v")
+	setKey(t, m, m.projectDir, "live", "", "v")
+	setKey(t, m, m.projectDir, "stale", "", "v") // no VAULT copy
+	m.reload()
+	m.reconcileProject()
+	m.reload()
+	if m.names[panelProject]["stale"] {
+		t.Fatal("stale project key (no VAULT copy) should have been pruned")
+	}
+	if !m.names[panelProject]["live"] {
+		t.Fatal("live project key (has VAULT copy) must be kept")
+	}
+}
+
+// TestReconcileSkipsWhenVaultEmpty guards against nuking a project when VAULT is
+// empty/uninitialized.
+func TestReconcileSkipsWhenVaultEmpty(t *testing.T) {
+	m := newTestModel(t)
+	setKey(t, m, m.projectDir, "a", "", "v")
+	setKey(t, m, m.projectDir, "b", "", "v")
+	m.reload() // VAULT store does not exist
+	m.reconcileProject()
+	m.reload()
+	if !m.names[panelProject]["a"] || !m.names[panelProject]["b"] {
+		t.Fatal("reconcile must not prune when VAULT is missing/empty")
 	}
 }

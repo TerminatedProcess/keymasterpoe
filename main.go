@@ -56,7 +56,6 @@ const (
 	modeAddName
 	modeAddDesc
 	modeConfirm
-	modeVDelete      // choosing scope for a VAULT delete of a deployed key
 	modeSyncConflict // resolving per-key value overrides during a panel sync
 	modeWipeConfirm  // typing the pane name to confirm wiping a deployment store
 	modeGroupAssign  // typing a group name to add/move the selected key into
@@ -127,10 +126,6 @@ type model struct {
 	revealPanel panel  // store the value was read from
 	revealVal   string // plaintext value (only while revealed)
 
-	// sequential rm queue for a multi-store VAULT delete
-	rmQueue []panel
-	rmKey   string
-
 	// panel → VAULT sync conflict resolution
 	syncPanel     panel
 	syncConflicts []string // keys in both panel and VAULT with differing values
@@ -169,6 +164,7 @@ func initialModel(avBin string) model {
 	}
 	m.groups = loadGroups(m.groupsPath)
 	m.reload()
+	m.reconcileProject() // prune invalid project "symlinks" before the UI appears
 	return m
 }
 
@@ -710,10 +706,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 		m.after = afterExec{}
-		// continue a multi-store VAULT delete, one `rm` (one TTY prompt) at a time
-		if len(m.rmQueue) > 0 {
-			return m, m.runRmQueue()
-		}
 		m.reload()
 		return m, nil
 
@@ -736,8 +728,6 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.handleAddKey(msg)
 	case modeConfirm:
 		return m.handleConfirmKey(msg)
-	case modeVDelete:
-		return m.handleVDeleteKey(msg)
 	case modeSyncConflict:
 		return m.handleSyncConflictKey(msg)
 	case modeWipeConfirm:
@@ -796,6 +786,8 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.startAdd()
 	case "d":
 		return m, m.startDelete()
+	case "u":
+		return m, m.startUngroup()
 	case "c":
 		if k := m.selected(); k != nil {
 			m.checkDrift(k.Name)
@@ -890,6 +882,8 @@ func (m model) handleConfirmKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, m.doMove(p.key, p.desc, p.src, p.dst)
 		case "pushgroup":
 			return m, m.doPushGroup(p.group, p.src, p.dst)
+		case "del", "delgroup":
+			return m, m.doDelete(p)
 		}
 	default:
 		m.mode = modeNormal
@@ -1089,17 +1083,21 @@ func (m *model) doCopy(key, desc string, src, dst panel) tea.Cmd {
 	return nil
 }
 
-// doMove copies then removes the source copy. The rm needs a TTY, so it is
-// handed to agent-vault via ExecProcess. Copy-before-rm guarantees a failed
-// move duplicates (safe) rather than loses.
+// doMove copies then removes the source copy (silent file-level delete).
+// Copy-before-rm guarantees a failed move duplicates (safe) rather than loses.
 func (m *model) doMove(key, desc string, src, dst panel) tea.Cmd {
 	if err := m.copyKeyOp(key, desc, m.dirFor(src), m.dirFor(dst)); err != nil {
 		m.statusMsg, m.statusErr = fmt.Sprintf("move aborted (copy failed, source intact): %v", err), true
 		return nil
 	}
+	if _, err := deleteKeysFromStore(m.dirFor(src), map[string]bool{key: true}); err != nil {
+		m.reload()
+		m.statusMsg, m.statusErr = fmt.Sprintf("copied to %s but source delete failed: %v", labelFor(dst), err), true
+		return nil
+	}
+	m.reload()
 	m.statusMsg = fmt.Sprintf("moved %s → %s", key, labelFor(dst))
-	c := m.av(m.dirFor(src), "rm", key)
-	return tea.ExecProcess(c, func(err error) tea.Msg { return execFinishedMsg{err} })
+	return nil
 }
 
 func (m *model) startAdd() {
@@ -1121,98 +1119,95 @@ func (m *model) launchAdd() tea.Cmd {
 	return tea.ExecProcess(c, func(err error) tea.Msg { return execFinishedMsg{err} })
 }
 
-// startDelete decides the scope of a delete. Deployment panes (PUBLIC/PROJECT)
-// delete only their own copy. In the VAULT (the library), a deployed key can't
-// be silently orphaned: a PUBLIC deployment forces delete-both-or-cancel; a
-// PROJECT deployment offers vault-only or both. Each `rm` is a separate TTY
-// prompt (agent-vault's own), sequenced via the rm queue.
+// startDelete opens a confirm for deleting the row under the cursor. Scope is set
+// by the pane: from VAULT a delete cascades everywhere (VAULT + PUBLIC + current
+// PROJECT), since deployments are copies of the master; from a deployment pane it
+// removes only that pane's copy and never touches the VAULT. A group header
+// deletes all its member keys at the same scope.
 func (m *model) startDelete() tea.Cmd {
-	if r, ok := m.currentRow(); ok && r.group != "" {
-		// disband is global (the group definition is shared), so only the VAULT —
-		// the master library — may do it. From a deployment pane it would wipe the
-		// group everywhere, which is never what you want there.
-		if m.active != panelVault {
-			m.statusMsg, m.statusErr = "disband only from VAULT (the group definition is global)", true
-			return nil
-		}
-		// deleting a group header disbands the group (metadata only) — the keys
-		// themselves are untouched and become ungrouped.
-		delete(m.groups, r.group)
-		if err := m.saveGroups(); err != nil {
-			m.statusMsg, m.statusErr = "save groups failed: "+err.Error(), true
-			return nil
-		}
-		m.openGroup[m.active] = ""
-		m.reload()
-		m.statusMsg = fmt.Sprintf("disbanded group %s (keys kept)", r.group)
+	r, ok := m.currentRow()
+	if !ok {
 		return nil
 	}
-	k := m.selected()
-	if k == nil {
-		return nil
+	if r.group != "" {
+		m.pending = pending{kind: "delgroup", group: r.group, src: m.active}
+	} else {
+		m.pending = pending{kind: "del", key: r.key.Name, src: m.active}
 	}
-	m.rmKey = k.Name
-	if m.active != panelVault {
-		m.rmQueue = []panel{m.active}
-		return m.runRmQueue()
-	}
-	inPublic := m.names[panelPublic][k.Name]
-	inProject := m.names[panelProject][k.Name]
-	if !inPublic && !inProject {
-		m.rmQueue = []panel{panelVault}
-		return m.runRmQueue()
-	}
-	m.mode = modeVDelete // deployed → ask for scope
+	m.mode = modeConfirm
 	return nil
 }
 
-// runRmQueue pops the next store off rmQueue and hands its `rm` to a TTY.
-// execFinishedMsg calls it again until the queue drains, then reloads.
-func (m *model) runRmQueue() tea.Cmd {
-	next := m.rmQueue[0]
-	m.rmQueue = m.rmQueue[1:]
-	c := m.av(m.dirFor(next), "rm", m.rmKey)
-	return tea.ExecProcess(c, func(err error) tea.Msg { return execFinishedMsg{err} })
+// deleteScope returns the stores a delete initiated from pane src touches: all
+// three from VAULT, else just src.
+func deleteScope(src panel) []panel {
+	if src == panelVault {
+		return []panel{panelVault, panelPublic, panelProject}
+	}
+	return []panel{src}
 }
 
-func (m model) handleVDeleteKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	inPublic := m.names[panelPublic][m.rmKey]
-	inProject := m.names[panelProject][m.rmKey]
-	k := msg.String()
-	cancel := func() (tea.Model, tea.Cmd) {
-		m.mode, m.statusMsg = modeNormal, "delete cancelled"
-		return m, nil
+// doDelete performs a confirmed delete: silent file-level removal of the target
+// key(s) from each store in scope. No TTY, no value ever decrypted. A VAULT
+// cascade that empties a group lets reload's pruneGroups drop the now-memberless
+// group definition automatically.
+func (m *model) doDelete(p pending) tea.Cmd {
+	keySet := map[string]bool{}
+	if p.kind == "delgroup" {
+		for _, k := range m.groups[p.group] {
+			keySet[k] = true
+		}
+	} else {
+		keySet[p.key] = true
 	}
-	if k == "esc" || k == "ctrl+c" || k == "n" {
-		return cancel()
+	total := 0
+	for _, st := range deleteScope(p.src) {
+		n, err := deleteKeysFromStore(m.dirFor(st), keySet)
+		if err != nil {
+			m.reload()
+			m.statusMsg, m.statusErr = fmt.Sprintf("delete failed in %s: %v", labelFor(st), err), true
+			return nil
+		}
+		total += n
 	}
+	m.openGroup[m.active] = "" // membership may have changed underfoot
+	m.reload()
+	everywhere := p.src == panelVault
 	switch {
-	case inPublic && inProject:
-		switch k {
-		case "b":
-			m.rmQueue = []panel{panelPublic, panelVault} // keep project (orphan allowed)
-		case "a":
-			m.rmQueue = []panel{panelPublic, panelProject, panelVault}
-		default:
-			return cancel()
-		}
-	case inPublic:
-		if k != "y" && k != "b" {
-			return cancel()
-		}
-		m.rmQueue = []panel{panelPublic, panelVault}
-	case inProject:
-		switch k {
-		case "v":
-			m.rmQueue = []panel{panelVault}
-		case "b":
-			m.rmQueue = []panel{panelProject, panelVault}
-		default:
-			return cancel()
-		}
+	case p.kind == "delgroup" && everywhere:
+		m.statusMsg = fmt.Sprintf("deleted group %s everywhere (%d copies)", p.group, total)
+	case p.kind == "delgroup":
+		m.statusMsg = fmt.Sprintf("deleted group %s from %s (%d keys)", p.group, labelFor(p.src), total)
+	case everywhere:
+		m.statusMsg = fmt.Sprintf("deleted %s everywhere (%d copies)", p.key, total)
+	default:
+		m.statusMsg = fmt.Sprintf("deleted %s from %s", p.key, labelFor(p.src))
 	}
-	m.mode = modeNormal
-	return m, m.runRmQueue()
+	return nil
+}
+
+// startUngroup removes a group definition (keys are kept) — the "ungroup" action.
+// Only valid on a group header, and only from VAULT since the definition is
+// global (ungrouping from a deployment would drop it everywhere).
+func (m *model) startUngroup() tea.Cmd {
+	r, ok := m.currentRow()
+	if !ok || r.group == "" {
+		m.statusMsg, m.statusErr = "u ungroups — put the cursor on a ▸ group header", true
+		return nil
+	}
+	if m.active != panelVault {
+		m.statusMsg, m.statusErr = "ungroup from VAULT (the group definition is global)", true
+		return nil
+	}
+	delete(m.groups, r.group)
+	if err := m.saveGroups(); err != nil {
+		m.statusMsg, m.statusErr = "save groups failed: "+err.Error(), true
+		return nil
+	}
+	m.openGroup[m.active] = ""
+	m.reload()
+	m.statusMsg = fmt.Sprintf("ungrouped %s (keys kept)", r.group)
+	return nil
 }
 
 // startSync pushes every key in the focused deployment pane up into the VAULT:
@@ -1343,6 +1338,88 @@ func (m model) handleWipeKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 	return m, nil
+}
+
+// deleteKeysFromStore removes the named keys from a store's vault.json in place,
+// touching only the (still-encrypted) entries and metadata — no value is ever
+// decrypted, so the never-reveal invariant holds. Each secret is independently
+// AES-GCM encrypted with no whole-file MAC, so dropping an entry leaves the rest
+// intact (verified). This is the sanctioned non-TTY delete path — agent-vault's
+// own `rm` refuses to run without a TTY, which makes bulk/cascade deletes
+// impossible through it. A missing store or key is a no-op. Returns #removed.
+func deleteKeysFromStore(dir string, keys map[string]bool) (int, error) {
+	path := filepath.Join(dir, "vault.json")
+	b, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(b, &top); err != nil {
+		return 0, err
+	}
+	raw, ok := top["secrets"]
+	if !ok {
+		return 0, nil
+	}
+	var secrets map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &secrets); err != nil {
+		return 0, err
+	}
+	n := 0
+	for k := range keys {
+		if _, ok := secrets[k]; ok {
+			delete(secrets, k)
+			n++
+		}
+	}
+	if n == 0 {
+		return 0, nil
+	}
+	nb, err := json.Marshal(secrets)
+	if err != nil {
+		return 0, err
+	}
+	top["secrets"] = nb
+	out, err := json.MarshalIndent(top, "", "  ")
+	if err != nil {
+		return 0, err
+	}
+	if err := os.WriteFile(path, out, 0o600); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
+// reconcileProject removes PROJECT keys whose VAULT copy no longer exists — the
+// "invalid symlink" cleanup. It runs at startup before the UI so a project vault
+// that fell out of sync (its master key was deleted while this dir was closed)
+// self-heals. Guarded: if the VAULT store is missing or empty we skip entirely,
+// so a misconfigured/uninitialized vault never nukes a populated project.
+func (m *model) reconcileProject() {
+	if !m.exists[panelProject] || !m.exists[panelVault] || len(m.keys[panelVault]) == 0 {
+		return
+	}
+	stale := map[string]bool{}
+	for _, k := range m.keys[panelProject] {
+		if !m.names[panelVault][k.Name] {
+			stale[k.Name] = true
+		}
+	}
+	if len(stale) == 0 {
+		return
+	}
+	n, err := deleteKeysFromStore(m.projectDir, stale)
+	if err != nil {
+		m.statusMsg, m.statusErr = "project reconcile failed: "+err.Error(), true
+		return
+	}
+	if n > 0 {
+		m.reload()
+		m.statusMsg = fmt.Sprintf("reconciled PROJECT: removed %d stale key(s) whose VAULT copy was gone", n)
+	}
 }
 
 // wipeStore destroys a deployment store by shredding its secret-bearing files and
@@ -1599,7 +1676,9 @@ func (m model) renderInfo(width int) string {
 			Render(fmt.Sprintf("group · %d member(s) · present in: %s", len(m.groups[r.group]), strings.Join(where, ", ")))
 		hintText := "enter open · s/g/p push whole group"
 		if m.active == panelVault {
-			hintText += " · d disband"
+			hintText += " · u ungroup · d delete keys everywhere"
+		} else {
+			hintText += " · d delete keys from this pane"
 		}
 		hint := lipgloss.NewStyle().Foreground(lipgloss.Color("243")).Render(hintText)
 		body = nameStyle.Render("▸ "+r.group) + "\n" + meta + "\n" + hint
@@ -1686,22 +1765,22 @@ func (m model) renderPrompt(width int) string {
 			q = fmt.Sprintf("overwrite %s in %s and remove from %s?", m.pending.key, labelFor(m.pending.dst), labelFor(m.pending.src))
 		case "pushgroup":
 			q = fmt.Sprintf("push group %s → %s overwrites existing member keys there?", m.pending.group, labelFor(m.pending.dst))
+		case "del":
+			if m.pending.src == panelVault {
+				q = fmt.Sprintf("delete %s EVERYWHERE (VAULT + PUBLIC + PROJECT)?", m.pending.key)
+			} else {
+				q = fmt.Sprintf("delete %s from %s only?", m.pending.key, labelFor(m.pending.src))
+			}
+		case "delgroup":
+			n := len(m.groups[m.pending.group])
+			if m.pending.src == panelVault {
+				q = fmt.Sprintf("delete group %s (%d keys) EVERYWHERE?", m.pending.group, n)
+			} else {
+				q = fmt.Sprintf("delete group %s (%d keys) from %s only?", m.pending.group, n, labelFor(m.pending.src))
+			}
 		}
 		warn := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("196")).Render(q)
 		return style.Render(warn + hint("  (y/n)"))
-	case modeVDelete:
-		inPublic := m.names[panelPublic][m.rmKey]
-		inProject := m.names[panelProject][m.rmKey]
-		var q string
-		switch {
-		case inPublic && inProject:
-			q = fmt.Sprintf("delete %s from VAULT — also in PUBLIC & PROJECT · [b] VAULT+PUBLIC (keep project) · [a] all three · [esc] cancel", m.rmKey)
-		case inPublic:
-			q = fmt.Sprintf("delete %s from VAULT — also in PUBLIC (can't orphan public) · [y] delete both · [esc] cancel", m.rmKey)
-		case inProject:
-			q = fmt.Sprintf("delete %s from VAULT — also in PROJECT · [v] VAULT only · [b] both · [esc] cancel", m.rmKey)
-		}
-		return style.Render(lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("196")).Render(q))
 	case modeSyncConflict:
 		if m.syncIdx < len(m.syncConflicts) {
 			key := m.syncConflicts[m.syncIdx]
@@ -1767,7 +1846,7 @@ func (m model) renderHelpScreen() string {
 		"    (empty name removes it); that also copies the key into every store already holding the",
 		"    group, so a deployed group stays whole. In any pane, enter on a ▸ header drills in to view.",
 		"    s / g / p on a ▸ header pushes the WHOLE group to VAULT / PUBLIC / PROJECT.",
-		"    d on a ▸ header (VAULT only) disbands the group (keys are kept, just ungrouped).",
+		"    u on a ▸ header (VAULT only) UNGROUPS it — drops the group definition, keeps every key.",
 		"",
 		"  Keys (act on the selected entry)",
 		"    s / g / p   COPY → VAULT / PUBLIC / PROJECT",
@@ -1776,8 +1855,9 @@ func (m model) renderHelpScreen() string {
 		"    c           CHECK drift: fingerprint-compare the selected key's value across stores",
 		"    v           VIEW the selected key's value in the detail box AND copy it to the clipboard",
 		"    a / n       ADD a new key here (also mirrored into VAULT)",
-		"    d           DELETE — deployment pane: that copy only. VAULT: can't orphan PUBLIC (delete both",
-		"                or cancel); PROJECT lets you keep or delete the deployment.",
+		"    d           DELETE (confirm y/n). From VAULT: deletes EVERYWHERE (VAULT+PUBLIC+PROJECT).",
+		"                From PUBLIC/PROJECT: deletes that pane's copy only. On a ▸ header: all its keys.",
+		"    u           UNGROUP a group (VAULT, cursor on a ▸ header) — keeps the keys.",
 		"    W           WIPE every key from the focused deployment pane (PUBLIC/PROJECT only; type the",
 		"                pane name to confirm). The VAULT master can never be wiped.",
 		"    R           reload all panes    h / ?  this help    esc  quit",
