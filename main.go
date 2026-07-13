@@ -147,6 +147,7 @@ type model struct {
 	groupsPath string
 	openGroup  [3]string
 	groupKey   string
+	lastGroup  string // last group name entered, to prefill the next assign prompt
 
 	statusMsg string
 	statusErr bool
@@ -919,7 +920,12 @@ func (m model) handleEnter() (tea.Model, tea.Cmd) {
 		m.openGroup[m.active], m.cursors[m.active] = r.group, 0
 		return m, nil
 	}
-	m.groupKey, m.input, m.mode = r.key.Name, "", modeGroupAssign
+	// prefill with this key's current group, else the last group entered
+	prefill := m.groupOf(r.key.Name)
+	if prefill == "" {
+		prefill = m.lastGroup
+	}
+	m.groupKey, m.input, m.mode = r.key.Name, prefill, modeGroupAssign
 	return m, nil
 }
 
@@ -998,6 +1004,7 @@ func (m model) handleGroupAssignKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.assignGroup(key, name)
+		m.lastGroup = name
 		if err := m.saveGroups(); err != nil {
 			m.statusMsg, m.statusErr = "save groups failed: "+err.Error(), true
 			return m, nil
