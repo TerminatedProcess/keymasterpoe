@@ -1065,6 +1065,12 @@ func (m *model) startMove(dst panel) tea.Cmd {
 	if k == nil {
 		return nil
 	}
+	// Moving deletes the source copy, which would desync a group — block it for
+	// grouped keys (ungroup first, or push/delete the whole group).
+	if g := m.groupOf(k.Name); g != "" {
+		m.statusMsg, m.statusErr = fmt.Sprintf("%s is in group %s — moving would split the group; ungroup it first (u) or act on the whole group", k.Name, g), true
+		return nil
+	}
 	if m.names[dst][k.Name] {
 		m.mode = modeConfirm
 		m.pending = pending{kind: "move", key: k.Name, desc: k.Desc, src: m.active, dst: dst}
@@ -1132,6 +1138,15 @@ func (m *model) startDelete() tea.Cmd {
 	if r.group != "" {
 		m.pending = pending{kind: "delgroup", group: r.group, src: m.active}
 	} else {
+		// A group is all-or-nothing in a deployment: deleting one member's copy
+		// from PUBLIC/PROJECT would desync that pane from the global definition.
+		// Remove the whole group here (d on its header), or manage it from VAULT.
+		if m.active != panelVault {
+			if g := m.groupOf(r.key.Name); g != "" {
+				m.statusMsg, m.statusErr = fmt.Sprintf("%s belongs to group %s — delete the whole group (d on its ▸ header) or manage it from VAULT", r.key.Name, g), true
+				return nil
+			}
+		}
 		m.pending = pending{kind: "del", key: r.key.Name, src: m.active}
 	}
 	m.mode = modeConfirm

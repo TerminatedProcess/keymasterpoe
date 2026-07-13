@@ -439,6 +439,49 @@ func TestUngroupVaultOnly(t *testing.T) {
 	}
 }
 
+// TestNoSingleMemberDeleteFromDeployment guards the group-consistency invariant:
+// deleting one grouped key's copy from PUBLIC (which would desync it from VAULT's
+// definition) is rejected; deleting the whole group from PUBLIC is allowed.
+func TestNoSingleMemberDeleteFromDeployment(t *testing.T) {
+	m := newTestModel(t)
+	m.groupsPath = filepath.Join(t.TempDir(), "groups.json")
+	setKey(t, m, m.vaultDir, "docuseal-api-key", "", "v")
+	setKey(t, m, m.vaultDir, "docuseal-token", "", "v")
+	setKey(t, m, m.publicDir, "docuseal-api-key", "", "v")
+	setKey(t, m, m.publicDir, "docuseal-token", "", "v")
+	m.reload()
+	m.assignGroup("docuseal-api-key", "docuseal")
+	m.assignGroup("docuseal-token", "docuseal")
+	m.reload()
+
+	// drill into the group in PUBLIC and try to delete one member → rejected
+	m.active, m.openGroup[panelPublic], m.cursors[panelPublic] = panelPublic, "docuseal", 0
+	m.startDelete()
+	if m.mode == modeConfirm {
+		t.Fatal("single grouped-member delete from PUBLIC should be rejected, not confirmed")
+	}
+	if !m.statusErr {
+		t.Fatal("expected an error status")
+	}
+
+	// but deleting the WHOLE group from PUBLIC is fine
+	m.openGroup[panelPublic] = ""
+	m.reload()
+	m.cursors[panelPublic] = 0 // the ▸ docuseal header
+	m.startDelete()
+	if m.pending.kind != "delgroup" || m.pending.src != panelPublic {
+		t.Fatalf("expected delgroup from PUBLIC, got kind=%q src=%d", m.pending.kind, m.pending.src)
+	}
+	mm, _ := m.handleConfirmKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	m = mm.(model)
+	if m.names[panelPublic]["docuseal-api-key"] || m.names[panelPublic]["docuseal-token"] {
+		t.Fatal("whole-group delete from PUBLIC should remove all members from PUBLIC")
+	}
+	if !m.names[panelVault]["docuseal-api-key"] {
+		t.Fatal("VAULT copies must be untouched by a PUBLIC group delete")
+	}
+}
+
 // TestGroupDeleteEverywhere checks d on a group header from VAULT deletes all its
 // member keys across every store.
 func TestGroupDeleteEverywhere(t *testing.T) {
