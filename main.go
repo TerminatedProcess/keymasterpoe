@@ -58,6 +58,7 @@ const (
 	modeConfirm
 	modeVDelete      // choosing scope for a VAULT delete of a deployed key
 	modeSyncConflict // resolving per-key value overrides during a panel sync
+	modeWipeConfirm  // typing the pane name to confirm wiping a deployment store
 )
 
 // pending records an operation awaiting a y/n confirmation.
@@ -124,6 +125,9 @@ type model struct {
 	syncPanel     panel
 	syncConflicts []string // keys in both panel and VAULT with differing values
 	syncIdx       int
+
+	// pane wipe: user must type the pane's label to confirm
+	wipeTgt panel
 
 	statusMsg string
 	statusErr bool
@@ -509,6 +513,8 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.handleVDeleteKey(msg)
 	case modeSyncConflict:
 		return m.handleSyncConflictKey(msg)
+	case modeWipeConfirm:
+		return m.handleWipeKey(msg)
 	}
 
 	m.statusMsg, m.statusErr = "", false
@@ -562,6 +568,8 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, m.startSync()
 	case "v":
 		m.doReveal()
+	case "W":
+		m.startWipe()
 	}
 	return m, nil
 }
@@ -882,6 +890,76 @@ func (m *model) overrideVault(key string) {
 	}
 }
 
+// startWipe begins a full wipe of the focused deployment store. The VAULT (the
+// master library) can never be wiped. Requires the user to type the pane's label
+// to confirm — no per-key TTY prompts.
+func (m *model) startWipe() {
+	if m.active == panelVault {
+		m.statusMsg, m.statusErr = "VAULT is the master library — it cannot be wiped", true
+		return
+	}
+	if !m.exists[m.active] || len(m.keys[m.active]) == 0 {
+		m.statusMsg, m.statusErr = fmt.Sprintf("%s is already empty — nothing to wipe", labelFor(m.active)), true
+		return
+	}
+	m.wipeTgt, m.input, m.mode = m.active, "", modeWipeConfirm
+}
+
+func (m model) handleWipeKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc", "ctrl+c":
+		m.mode, m.input = modeNormal, ""
+		m.statusMsg = "wipe cancelled"
+	case "enter":
+		if strings.TrimSpace(m.input) != labelFor(m.wipeTgt) {
+			m.mode, m.input = modeNormal, ""
+			m.statusMsg, m.statusErr = "name did not match — wipe cancelled", true
+			return m, nil
+		}
+		n := len(m.keys[m.wipeTgt])
+		tgt := m.wipeTgt
+		if err := m.wipeStore(tgt); err != nil {
+			m.mode, m.input = modeNormal, ""
+			m.statusMsg, m.statusErr = fmt.Sprintf("wipe failed: %v", err), true
+			return m, nil
+		}
+		m.mode, m.input = modeNormal, ""
+		m.reload()
+		m.statusMsg = fmt.Sprintf("wiped %d key(s) from %s", n, labelFor(tgt))
+	case "backspace":
+		if len(m.input) > 0 {
+			m.input = m.input[:len(m.input)-1]
+		}
+	case "ctrl+u":
+		m.input = ""
+	default:
+		if r := msg.Runes; len(r) > 0 {
+			m.input += string(r)
+		}
+	}
+	return m, nil
+}
+
+// wipeStore destroys a deployment store by shredding its secret-bearing files and
+// removing the store directory. agent-vault re-inits the store on the next `set`,
+// so a wiped pane simply reads as empty. Never called for the VAULT.
+func (m *model) wipeStore(p panel) error {
+	if p == panelVault {
+		return fmt.Errorf("refusing to wipe VAULT")
+	}
+	dir := m.dirFor(p)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		if !e.IsDir() {
+			shredFile(filepath.Join(dir, e.Name()))
+		}
+	}
+	return os.RemoveAll(dir)
+}
+
 // --- view -----------------------------------------------------------------
 
 func (m model) View() string {
@@ -1147,6 +1225,11 @@ func (m model) renderPrompt(width int) string {
 			warn := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("196")).Render(q)
 			return style.Render(warn + hint(fmt.Sprintf("  (%d/%d)", m.syncIdx+1, len(m.syncConflicts))))
 		}
+	case modeWipeConfirm:
+		lbl := labelFor(m.wipeTgt)
+		warn := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("196")).
+			Render(fmt.Sprintf("WIPE all %d key(s) from %s — type %s to confirm: ", len(m.keys[m.wipeTgt]), lbl, lbl))
+		return style.Render(warn + m.input + cursor + hint("  (enter confirm · esc cancel)"))
 	}
 	if m.filterActive && m.filter != "" {
 		return style.Render(label("filter: ") + m.filter + hint("  (/ edit · esc clear)"))
@@ -1168,7 +1251,7 @@ func (m model) renderStatus(width int) string {
 
 func (m model) renderHelpBar(width int) string {
 	return lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("202")).Padding(0, 1).Width(width).
-		Render("jk nav  tab panes  / filter  s/g/p copy  S/G/P move  y sync→V  c check  v view+copy  a add  d delete  R reload  ? help  q quit")
+		Render("jk nav  tab panes  / filter  s/g/p copy  S/G/P move  y sync→V  c check  v view+copy  a add  d delete  W wipe  R reload  ? help  q quit")
 }
 
 func (m model) renderHelpScreen() string {
@@ -1194,6 +1277,8 @@ func (m model) renderHelpScreen() string {
 		"    a / n       ADD a new key here (also mirrored into VAULT)",
 		"    d           DELETE — deployment pane: that copy only. VAULT: can't orphan PUBLIC (delete both",
 		"                or cancel); PROJECT lets you keep or delete the deployment.",
+		"    W           WIPE every key from the focused deployment pane (PUBLIC/PROJECT only; type the",
+		"                pane name to confirm). The VAULT master can never be wiped.",
 		"    R           reload all panes    ?  this help    q / esc  quit",
 		"",
 		"  Indicators (left of each key) — the VAULT holds keys; PUBLIC/PROJECT are deployments:",
