@@ -436,6 +436,36 @@ func TestDisbandVaultOnly(t *testing.T) {
 	}
 }
 
+// TestGroupAssignVaultOnly checks enter-on-a-key opens the assign prompt only in
+// VAULT; deployment panes reject it and never enter modeGroupAssign.
+func TestGroupAssignVaultOnly(t *testing.T) {
+	m := newTestModel(t)
+	m.groupsPath = filepath.Join(t.TempDir(), "groups.json")
+	setKey(t, m, m.publicDir, "loose-key", "", "v")
+	m.reload()
+
+	// from PUBLIC: enter on the key must be rejected
+	m.active, m.cursors[panelPublic] = panelPublic, 0
+	mm, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyEnter})
+	m = mm.(model)
+	if m.mode == modeGroupAssign {
+		t.Fatal("enter on a PUBLIC key should not open the group-assign prompt")
+	}
+	if !m.statusErr {
+		t.Fatal("expected an error status assigning a group from PUBLIC")
+	}
+
+	// from VAULT: enter on a key opens the prompt
+	setKey(t, m, m.vaultDir, "vault-key", "", "v")
+	m.reload()
+	m.active, m.cursors[panelVault] = panelVault, 0
+	mm, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyEnter})
+	m = mm.(model)
+	if m.mode != modeGroupAssign {
+		t.Fatalf("enter on a VAULT key should open modeGroupAssign, got %d", m.mode)
+	}
+}
+
 // TestVaultDeleteScope checks the VAULT delete rules build the right rm queue.
 func TestVaultDeleteScope(t *testing.T) {
 	m := newTestModel(t)

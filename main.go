@@ -920,6 +920,12 @@ func (m model) handleEnter() (tea.Model, tea.Cmd) {
 		m.openGroup[m.active], m.cursors[m.active] = r.group, 0
 		return m, nil
 	}
+	// group membership is managed only from the VAULT master; PUBLIC/PROJECT are
+	// deployments, so assigning/removing a group there is disallowed.
+	if m.active != panelVault {
+		m.statusMsg, m.statusErr = "manage groups from VAULT (PUBLIC/PROJECT are deployments)", true
+		return m, nil
+	}
 	// prefill with this key's current group, else the last group entered
 	prefill := m.groupOf(r.key.Name)
 	if prefill == "" {
@@ -1756,14 +1762,15 @@ func (m model) renderHelpScreen() string {
 		"  Navigation",
 		"    j / k / ↑ / ↓      move within a pane",
 		"    tab / h / l / ← →  switch pane",
-		"    enter              open a group (drill in) · on a key: assign it to a group",
+		"    enter              open a group (drill in) · on a VAULT key: assign it to a group",
 		"    esc                back out of an opened group (or quit)",
 		"    /                  fuzzy-filter the focused pane (esc clears)",
 		"",
 		"  Groups (one global definition, shown in every pane that holds the keys)",
-		"    A group collapses its keys under a ▸ header. enter on a key names/creates a group",
-		"    for it (empty name removes it). Adding a key to a group also copies it into VAULT",
-		"    and into every store already holding that group, so a deployed group stays whole.",
+		"    A group collapses its keys under a ▸ header. Groups are MANAGED ONLY FROM VAULT —",
+		"    PUBLIC/PROJECT are deployments. In VAULT, enter on a key names/creates a group for it",
+		"    (empty name removes it); that also copies the key into every store already holding the",
+		"    group, so a deployed group stays whole. In any pane, enter on a ▸ header drills in to view.",
 		"    s / g / p on a ▸ header pushes the WHOLE group to VAULT / PUBLIC / PROJECT.",
 		"    d on a ▸ header (VAULT only) disbands the group (keys are kept, just ungrouped).",
 		"",
