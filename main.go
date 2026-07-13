@@ -749,7 +749,7 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	m.statusMsg, m.statusErr = "", false
 
 	switch msg.String() {
-	case "q", "ctrl+c":
+	case "ctrl+c":
 		return m, tea.Quit
 	case "esc":
 		// esc first backs out of a drilled-in group; otherwise quits.
@@ -1736,7 +1736,7 @@ func (m model) renderStatus(width int) string {
 	style := lipgloss.NewStyle().Padding(0, 1).Width(width)
 	if m.statusMsg == "" {
 		// idle: a quiet, single-line affordance instead of the old command bar.
-		return style.Foreground(lipgloss.Color("243")).Render("h — help    q — quit")
+		return style.Foreground(lipgloss.Color("243")).Render("h — help    esc — quit")
 	}
 	color := lipgloss.Color("82")
 	if m.statusErr {
@@ -1780,7 +1780,7 @@ func (m model) renderHelpScreen() string {
 		"                or cancel); PROJECT lets you keep or delete the deployment.",
 		"    W           WIPE every key from the focused deployment pane (PUBLIC/PROJECT only; type the",
 		"                pane name to confirm). The VAULT master can never be wiped.",
-		"    R           reload all panes    h / ?  this help    q / esc  quit",
+		"    R           reload all panes    h / ?  this help    esc  quit",
 		"",
 		"  Indicators (left of each key) — the VAULT holds keys; PUBLIC/PROJECT are deployments:",
 		"    VAULT row:     " + lipgloss.NewStyle().Foreground(lipgloss.Color("82")).Render("●") + " deployed to PUBLIC   " +
