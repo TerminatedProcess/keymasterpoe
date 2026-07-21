@@ -82,10 +82,11 @@ type rowItem struct {
 // afterExec records work to run once a tea.ExecProcess subprocess returns —
 // currently only the auto-mirror of a freshly-added key up into the VAULT.
 type afterExec struct {
-	mirror bool
-	key    string
-	desc   string
-	srcDir string
+	mirror  bool
+	key     string
+	desc    string
+	srcDir  string
+	editKey string // set when the exec was an in-place VAULT value edit (no mirror)
 }
 
 type model struct {
@@ -705,6 +706,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.statusMsg = fmt.Sprintf("added %s (mirrored to VAULT)", m.after.key)
 			}
 		}
+		if m.after.editKey != "" && msg.err == nil {
+			m.statusMsg = fmt.Sprintf("updated %s (VAULT — deployments unchanged; push to propagate)", m.after.editKey)
+		}
 		m.after = afterExec{}
 		m.reload()
 		return m, nil
@@ -787,7 +791,12 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "d":
 		return m, m.startDelete()
 	case "u":
-		return m, m.startUngroup()
+		// Overloaded by context (like s/g/p/d): on a ▸ group header it ungroups,
+		// on a key it updates that key's value in place (VAULT only).
+		if r, ok := m.currentRow(); ok && r.group != "" {
+			return m, m.startUngroup()
+		}
+		return m, m.startEdit()
 	case "c":
 		if k := m.selected(); k != nil {
 			m.checkDrift(k.Name)
@@ -1122,6 +1131,31 @@ func (m *model) launchAdd() tea.Cmd {
 	if m.addTgt != panelVault {
 		m.after = afterExec{mirror: true, key: m.addKey, desc: m.addDesc, srcDir: m.dirFor(m.addTgt)}
 	}
+	return tea.ExecProcess(c, func(err error) tea.Msg { return execFinishedMsg{err} })
+}
+
+// startEdit re-enters the value for the selected VAULT key on a real TTY,
+// overwriting it in place. It reuses the same TTY handoff as add — the value is
+// typed straight into `agent-vault set`, which overwrites an existing key and
+// retains its desc, so no plaintext ever passes through keymaster's memory.
+// VAULT-only: deployments are independent copies by convention (see CLAUDE.md),
+// so editing the master never cascades — push (s/g/p) afterward to propagate.
+func (m *model) startEdit() tea.Cmd {
+	if m.active != panelVault {
+		m.statusMsg, m.statusErr = "edit is VAULT-only — deployments are independent copies; edit here then push (s/g/p) to propagate", true
+		return nil
+	}
+	k := m.selected()
+	if k == nil {
+		m.statusMsg, m.statusErr = "select a key to edit (not a group header)", true
+		return nil
+	}
+	args := []string{"set", k.Name}
+	if k.Desc != "" {
+		args = append(args, "--desc", k.Desc)
+	}
+	m.after = afterExec{editKey: k.Name}
+	c := m.av(m.vaultDir, args...)
 	return tea.ExecProcess(c, func(err error) tea.Msg { return execFinishedMsg{err} })
 }
 
@@ -1872,7 +1906,8 @@ func (m model) renderHelpScreen() string {
 		"    a / n       ADD a new key here (also mirrored into VAULT)",
 		"    d           DELETE (confirm y/n). From VAULT: deletes EVERYWHERE (VAULT+PUBLIC+PROJECT).",
 		"                From PUBLIC/PROJECT: deletes that pane's copy only. On a ▸ header: all its keys.",
-		"    u           UNGROUP a group (VAULT, cursor on a ▸ header) — keeps the keys.",
+		"    u           On a key: UPDATE its value in place (VAULT only; re-typed on a TTY, deployments",
+		"                stay independent — push s/g/p to propagate). On a ▸ header: UNGROUP (keeps keys).",
 		"    W           WIPE every key from the focused deployment pane (PUBLIC/PROJECT only; type the",
 		"                pane name to confirm). The VAULT master can never be wiped.",
 		"    R           reload all panes    h / ?  this help    esc  quit",
